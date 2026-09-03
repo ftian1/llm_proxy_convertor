@@ -1,0 +1,5 @@
+# runtime logs (may contain full conversation payloads)
+*.log
+
+# local secrets
+.env
