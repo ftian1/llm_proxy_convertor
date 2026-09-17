@@ -26,6 +26,12 @@
  *                        否则补 /v1/chat/completions
  *   ATTACH_REASONING=1   可选, 转换时把思考内容附到 assistant 消息的 reasoning_content
  *                        (DeepSeek/Kimi 等思考型上游要求; 严格 OpenAI 上游会拒绝该字段, 默认关闭)
+ *   EMPTY_RESPONSE_MODE  可选, 上游返回空响应 (finish_reason=stop 但没有任何可见 content,
+ *                        思考型模型只吐 reasoning、或 Azure 内容过滤拦截时常见) 的兜底方式:
+ *                        text 补一段可见说明文本 (默认) | error 报错中止本轮 (Anthropic 发
+ *                        error 事件, Responses 发 response.failed) | pass 原样透传
+ *                        (客户端会表现为 "Done 但没有输出")。两条协议 (anthropic/responses)
+ *                        的流式与非流式转换都生效
  *
  * 出站代理 (Node 核心 http/https 不会自动读代理环境变量, 需手动处理):
  *   GATEWAY_PROXY 可选, 强制指定代理, 例: http://proxy.host:912 (忽略 NO_PROXY)
@@ -59,6 +65,42 @@ const CONVERT_ANTHROPIC = process.env.CONVERT_ANTHROPIC !== '0';
 const CONVERT_RESPONSES = process.env.CONVERT_RESPONSES !== '0';
 const ATTACH_REASONING = process.env.ATTACH_REASONING === '1';
 const UPSTREAM_CHAT_PATH = process.env.UPSTREAM_CHAT_PATH || '';
+// 上游返回空响应 (finish_reason=stop 但没有任何可见 content) 时的兜底:
+//   text 补一段可见说明文本 | error 用 Anthropic error 事件中止本轮 | pass 原样透传
+const EMPTY_RESPONSE_MODE = process.env.EMPTY_RESPONSE_MODE || 'text';
+// messages[] 里出现 role:"system" (Anthropic 规范不允许, Claude Code 用后台任务通知这么发)
+// 时按 user 发送: 上游遇到「末条 system + 声明无用户输入」会空响应。
+// 只改这一条消息的 role, 前缀缓存不受影响; NORMALIZE_INLINE_SYSTEM=0 可关闭。
+const NORMALIZE_INLINE_SYSTEM = process.env.NORMALIZE_INLINE_SYSTEM !== '0';
+
+// 空响应时把出站消息末段打出来, 便于定位到底是哪条 prompt 触发的
+function outboundTailLines(outBody, n = 3, preview = 200) {
+  let msgs;
+  try {
+    msgs = JSON.parse(outBody.toString('utf8')).messages;
+  } catch {
+    return ['(出站 body 解析失败)'];
+  }
+  if (!Array.isArray(msgs) || msgs.length === 0) return ['(无 messages)'];
+  const lines = [];
+  for (let i = Math.max(0, msgs.length - n); i < msgs.length; i += 1) {
+    const m = msgs[i] || {};
+    const raw = typeof m.content === 'string' ? m.content : JSON.stringify(m.content === undefined ? null : m.content);
+    const flat = String(raw === null || raw === undefined ? '' : raw).replace(/\s+/g, ' ');
+    lines.push(`#${i} ${m.role}(${flat.length}B): ${flat.slice(0, preview)}${flat.length > preview ? ' …' : ''}`);
+  }
+  return lines;
+}
+
+// 统计 Anthropic 请求 messages[] 中 role:"system" 的条数 (正常应为 0)
+function countInlineSystemMessages(parsed) {
+  if (!parsed || !Array.isArray(parsed.messages)) return 0;
+  let n = 0;
+  for (const m of parsed.messages) {
+    if (m && m.role === 'system') n += 1;
+  }
+  return n;
+}
 
 // chat completions 出站目标: UPSTREAM_CHAT_PATH (路径或完整 URL) 优先, 否则由 UPSTREAM_URL 推导
 function chatCompletionsTarget() {
@@ -474,6 +516,8 @@ function handleRequest(req, res, body, id) {
     convertKind = 'responses';
   }
 
+  let inlineSystemCount = 0;
+  let trailingSystemNormalized = false;
   if (convertKind) {
     let parsed;
     try {
@@ -487,7 +531,15 @@ function handleRequest(req, res, body, id) {
     try {
       let converted;
       if (convertKind === 'anthropic') {
-        converted = convert.anthropicToOpenAI(parsed);
+        inlineSystemCount = countInlineSystemMessages(parsed);
+        const lastMsg = Array.isArray(parsed.messages) ? parsed.messages[parsed.messages.length - 1] : null;
+        if (lastMsg && lastMsg.role === 'system') {
+          trailingSystemNormalized = NORMALIZE_INLINE_SYSTEM;
+          console.log(`[#${id}] 末条消息 role=system (messages[] 内共 ${inlineSystemCount} 条 system,`
+            + ' 中间位置的保持 system) → '
+            + (NORMALIZE_INLINE_SYSTEM ? '已按 user 发送 (NORMALIZE_INLINE_SYSTEM=0 可关闭)' : '按原样发送'));
+        }
+        converted = convert.anthropicToOpenAI(parsed, { normalizeInlineSystem: NORMALIZE_INLINE_SYSTEM });
       } else {
         toolContext = new convert.ToolContext();
         toolContext.buildFromRequest(parsed);
@@ -536,6 +588,8 @@ function handleRequest(req, res, body, id) {
     outbound_headers: outHeaders,
     request_body: outBody.toString('utf8'),
   };
+  if (inlineSystemCount > 0) record.inline_system_messages = inlineSystemCount;
+  if (trailingSystemNormalized) record.trailing_system_normalized = true;
   if (convertKind) record.request_body_original = body.toString('utf8');
   if (convertKind) record.protocol_convert = `${convertKind} -> chat/completions`;
 
@@ -634,8 +688,11 @@ function handleRequest(req, res, body, id) {
         // ---- 转换模式: 上游 chat 响应按客户端协议重新组装 ----
         if (isSSE) {
           const streamConv = convertKind === 'anthropic'
-            ? new convert.AnthropicStreamConverter()
-            : new convert.ResponsesStreamConverter(toolContext, { attachReasoning: ATTACH_REASONING });
+            ? new convert.AnthropicStreamConverter({ emptyResponseMode: EMPTY_RESPONSE_MODE })
+            : new convert.ResponsesStreamConverter(toolContext, {
+                attachReasoning: ATTACH_REASONING,
+                emptyResponseMode: EMPTY_RESPONSE_MODE
+              });
           const outHeaders2 = { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' };
           for (const [k, v] of Object.entries(respHeaders)) {
             if (!['content-type', 'content-length', 'transfer-encoding'].includes(k)) outHeaders2[k] = v;
@@ -676,6 +733,20 @@ function handleRequest(req, res, body, id) {
           upRes.on('end', () => {
             if (lineBuf) feedLine(lineBuf);
             writeFrames(streamConv.flush());
+            // 记录上游原始 finish_reason: 只有它才能区分 "模型自己 stop" 与
+            // "content_filter 拦截" (后者在 Anthropic 侧同样表现为空响应)
+            if (streamConv.upstreamFinishReason) {
+              console.log(`[#${id}] upstream finish_reason: ${streamConv.upstreamFinishReason}`);
+              record.upstream_finish_reason = streamConv.upstreamFinishReason;
+            }
+            if (streamConv.emptyResponseDetected) {
+              console.log(`[#${id}] [WARN] 上游空响应: finish_reason=${streamConv.upstreamFinishReason || '?'},`
+                + ` 没有任何可见输出 (兜底策略=${EMPTY_RESPONSE_MODE})`);
+              for (const l of outboundTailLines(outBody)) {
+                console.log(`[#${id}]        出站末段 ${l}`);
+              }
+              record.empty_response = true;
+            }
             record.response_body_upstream = Buffer.concat(upstreamChunks).toString('utf8');
             record.response_body = convertedChunks.join('');
             saveRecord();
@@ -695,8 +766,10 @@ function handleRequest(req, res, body, id) {
                       ? convert.chatErrorToAnthropicError(parsed)
                       : convert.chatErrorToResponseError(parsed))
                   : (convertKind === 'anthropic'
-                      ? convert.openaiToAnthropic(parsed)
-                      : convert.chatCompletionToResponse(parsed, toolContext))
+                  ? convert.openaiToAnthropic(parsed)
+                  : convert.chatCompletionToResponse(parsed, toolContext, {
+                      emptyResponseMode: EMPTY_RESPONSE_MODE
+                    }))
               ));
             } catch (e) {
               console.error(`[#${id}] convert response failed (${e.message}), 原样透传`);
@@ -820,6 +893,9 @@ server.listen(PORT, () => {
     if (ATTACH_REASONING) {
       console.log('ATTACH_REASONING : 开启 — 转换时附挂 reasoning_content (思考型上游)');
     }
+    console.log('末条 system 归一 : ' + (NORMALIZE_INLINE_SYSTEM
+      ? '开启 — messages[] 内 role:"system" 按 user 发送 (NORMALIZE_INLINE_SYSTEM=0 关闭)'
+      : '关闭 — 按原样转发'));
   }
   try {
     const upUrl = new URL(UPSTREAM_URL);

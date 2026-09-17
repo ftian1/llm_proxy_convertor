@@ -38,6 +38,44 @@ test('anthropic 基础请求 (system/max_tokens/stream/tools)', () => {
   assert.strictEqual(chat.stream_options.include_usage, true); // usage 注入
 });
 
+test('anthropic messages[] 内的 system 归一为 user (Claude Code 后台任务通知)', () => {
+  const notif = [{ type: 'text', text: '[SYSTEM NOTIFICATION - NOT USER INPUT]\n'
+    + 'No human input has been received since the last genuine user message.\n'
+    + '<task-notification>\n<task-id>abc</task-id>\n<status>completed</status>\n</task-notification>' }];
+  const body = {
+    model: 'm',
+    system: 'top-level system',
+    messages: [
+      { role: 'user', content: 'hi' },
+      { role: 'system', content: 'CLAUDE.md / env 上下文 (中间位置)' },
+      { role: 'assistant', content: [{ type: 'text', text: 'ok' }] },
+      { role: 'user', content: '' },
+      { role: 'system', content: notif },
+    ],
+  };
+  const chat = c.anthropicToOpenAI(body);
+  // 顶层 system 与「中间位置」的 system 都原样保留; 只有末条归一为 user
+  assert.deepStrictEqual(chat.messages.map((m) => m.role),
+    ['system', 'user', 'system', 'assistant', 'user', 'user']);
+  // 内容逐字保留, 只动 role 字段
+  assert.strictEqual(chat.messages[2].content, 'CLAUDE.md / env 上下文 (中间位置)');
+  assert.strictEqual(chat.messages[5].content, notif[0].text);
+
+  // 前缀 (末条之前) 与关闭开关时完全一致 -> 不影响前缀缓存
+  const off = c.anthropicToOpenAI(body, { normalizeInlineSystem: false });
+  assert.deepStrictEqual(off.messages.map((m) => m.role),
+    ['system', 'user', 'system', 'assistant', 'user', 'system']);
+  assert.deepStrictEqual(chat.messages.slice(0, 5), off.messages.slice(0, 5));
+  assert.strictEqual(chat.messages[5].content, off.messages[5].content);
+
+  // 末条不是 system 时不动任何东西
+  const userTail = c.anthropicToOpenAI({
+    model: 'm',
+    messages: [{ role: 'user', content: 'hi' }, { role: 'system', content: 'mid' }, { role: 'user', content: 'tail' }],
+  });
+  assert.deepStrictEqual(userTail.messages.map((m) => m.role), ['user', 'system', 'user']);
+});
+
 test('anthropic tool_use/tool_result/thinking 历史转换', () => {
   const chat = c.anthropicToOpenAI({
     model: 'm',
@@ -345,6 +383,182 @@ test('错误体转换 (responses/anthropic)', () => {
   assert.strictEqual(ae.type, 'error');
   assert.strictEqual(ae.error.type, 'invalid_request_error');
   assert.strictEqual(ae.error.message, 'bad token');
+});
+
+// ---------------------------------------------------------------------------
+// 空响应兜底: finish_reason=stop 但整条流没有任何可见 content
+// (思考型模型只吐 reasoning 就停, 或 Azure content_filter 把 content 清空)
+// ---------------------------------------------------------------------------
+
+const emptyStream = () => [
+  JSON.stringify({ id: 'chatcmpl_x', model: 'm', choices: [{ delta: {} }] }),
+  JSON.stringify({ id: 'chatcmpl_x', choices: [{ delta: {}, finish_reason: 'stop' }] }),
+  '[DONE]',
+];
+const eventTypes = (out) => [...out.matchAll(/event: (\w+)/g)].map((m) => m[1]);
+const drive = (conv, feed) => feed.map((d) => conv.push(d).join('')).join('') + conv.flush().join('');
+
+test('AnthropicStreamConverter: 空响应默认补可见文本 (不再是静默 Done)', () => {
+  const a = new c.AnthropicStreamConverter();
+  const out = drive(a, emptyStream());
+  assert.deepStrictEqual(eventTypes(out), ['message_start', 'content_block_start',
+    'content_block_delta', 'content_block_stop', 'message_delta', 'message_stop']);
+  assert.ok(out.includes('上游返回了空响应')); // 兜底文本
+  assert.strictEqual(a.emptyResponseDetected, true);
+  assert.strictEqual(a.upstreamFinishReason, 'stop');
+});
+
+test('AnthropicStreamConverter: EMPTY_RESPONSE_MODE=error 中止本轮 / pass 原样透传', () => {
+  const errConv = new c.AnthropicStreamConverter({ emptyResponseMode: 'error' });
+  const errOut = drive(errConv, emptyStream());
+  assert.deepStrictEqual(eventTypes(errOut), ['message_start', 'error']);
+  assert.ok(!errOut.includes('message_stop')); // 已用 error 事件收尾
+
+  const passConv = new c.AnthropicStreamConverter({ emptyResponseMode: 'pass' });
+  const passOut = drive(passConv, emptyStream());
+  assert.deepStrictEqual(eventTypes(passOut), ['message_start', 'message_delta', 'message_stop']);
+  assert.strictEqual(passConv.emptyResponseDetected, true); // pass 也照样记录告警
+});
+
+test('AnthropicStreamConverter: 有可见输出时不触发空响应兜底', () => {
+  const a = new c.AnthropicStreamConverter();
+  drive(a, [
+    JSON.stringify({ choices: [{ delta: { content: 'hi' } }] }),
+    JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+    '[DONE]',
+  ]);
+  assert.strictEqual(a.emptyResponseDetected, false);
+});
+
+test('AnthropicStreamConverter: 仅 thinking 也算空响应, 且 thinking 块补 signature_delta', () => {
+  const a = new c.AnthropicStreamConverter();
+  const out = drive(a, [
+    JSON.stringify({ choices: [{ delta: { reasoning_content: '想一下' } }] }),
+    JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+    '[DONE]',
+  ]);
+  assert.ok(out.includes('thinking_delta'));
+  assert.ok(out.includes('signature_delta'));
+  assert.ok(out.includes('上游返回了空响应'));
+  assert.strictEqual(a.emptyResponseDetected, true);
+});
+
+test('AnthropicStreamConverter: content_filter 映射为 refusal 并记录原始 finish_reason', () => {
+  const a = new c.AnthropicStreamConverter();
+  const out = drive(a, [
+    JSON.stringify({ choices: [{ delta: {}, finish_reason: 'content_filter' }] }),
+    '[DONE]',
+  ]);
+  const delta = JSON.parse(out.match(/event: message_delta\ndata: (.*)/)[1]);
+  assert.strictEqual(delta.delta.stop_reason, 'refusal');
+  assert.strictEqual(a.upstreamFinishReason, 'content_filter');
+});
+
+// ---------------------------------------------------------------------------
+// 空响应兜底: responses 协议 (流式 + 非流式)
+// ---------------------------------------------------------------------------
+
+test('ResponsesStreamConverter: 空响应默认补可见文本 (不再是静默空回复)', () => {
+  const r = new c.ResponsesStreamConverter(new c.ToolContext());
+  const out = drive(r, [
+    JSON.stringify({ id: 'chatcmpl_e', model: 'm', choices: [{ delta: {} }] }),
+    JSON.stringify({ id: 'chatcmpl_e', choices: [{ delta: {}, finish_reason: 'stop' }] }),
+    '[DONE]',
+  ]);
+  assert.ok(out.includes('event: response.output_text.delta'));
+  assert.ok(out.includes('上游返回了空响应'));
+  assert.ok(out.includes('event: response.completed'));
+  assert.strictEqual(r.emptyResponseDetected, true);
+  assert.strictEqual(r.upstreamFinishReason, 'stop');
+});
+
+test('ResponsesStreamConverter: EMPTY_RESPONSE_MODE=error/pass', () => {
+  const errConv = new c.ResponsesStreamConverter(new c.ToolContext(), { emptyResponseMode: 'error' });
+  const errOut = drive(errConv, [
+    JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+    '[DONE]',
+  ]);
+  assert.ok(errOut.includes('event: response.failed'));
+  assert.ok(!errOut.includes('event: response.completed'));
+
+  const passConv = new c.ResponsesStreamConverter(new c.ToolContext(), { emptyResponseMode: 'pass' });
+  const passOut = drive(passConv, [
+    JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+    '[DONE]',
+  ]);
+  assert.ok(!passOut.includes('上游返回了空响应'));
+  assert.ok(passOut.includes('event: response.completed'));
+  assert.strictEqual(passConv.emptyResponseDetected, true); // pass 也照样记录
+});
+
+test('ResponsesStreamConverter: 仅 reasoning / 正常文本 / length 的行为', () => {
+  // 只有 reasoning -> 算空响应, 仍补文本
+  const onlyReasoning = new c.ResponsesStreamConverter(new c.ToolContext());
+  const ro = drive(onlyReasoning, [
+    JSON.stringify({ choices: [{ delta: { reasoning_content: '想一下' } }] }),
+    JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+    '[DONE]',
+  ]);
+  assert.ok(ro.includes('上游返回了空响应'));
+
+  // 有正文 -> 不兜底
+  const withText = new c.ResponsesStreamConverter(new c.ToolContext());
+  drive(withText, [
+    JSON.stringify({ choices: [{ delta: { content: 'hi' } }] }),
+    JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+    '[DONE]',
+  ]);
+  assert.strictEqual(withText.emptyResponseDetected, false);
+
+  // length 截断 -> 不兜底, 保持 incomplete
+  const truncated = new c.ResponsesStreamConverter(new c.ToolContext());
+  const to = drive(truncated, [
+    JSON.stringify({ choices: [{ delta: {}, finish_reason: 'length' }] }),
+    '[DONE]',
+  ]);
+  assert.strictEqual(truncated.emptyResponseDetected, false);
+  const done = JSON.parse(to.match(/event: response.completed\ndata: (.*)/)[1]);
+  assert.strictEqual(done.response.status, 'incomplete');
+  assert.strictEqual(done.response.incomplete_details.reason, 'max_output_tokens');
+});
+
+test('ResponsesStreamConverter: content_filter -> incomplete/content_filter', () => {
+  const r = new c.ResponsesStreamConverter(new c.ToolContext());
+  const out = drive(r, [
+    JSON.stringify({ choices: [{ delta: {}, finish_reason: 'content_filter' }] }),
+    '[DONE]',
+  ]);
+  const done = JSON.parse(out.match(/event: response.completed\ndata: (.*)/)[1]);
+  assert.strictEqual(done.response.status, 'incomplete');
+  assert.strictEqual(done.response.incomplete_details.reason, 'content_filter');
+  assert.ok(out.includes('上游内容过滤拦截了输出'));
+  assert.strictEqual(r.upstreamFinishReason, 'content_filter');
+});
+
+test('chatCompletionToResponse: 空响应补文本 / content_filter -> incomplete', () => {
+  const empty = c.chatCompletionToResponse({
+    id: 'chatcmpl_e', model: 'm', created: 1,
+    choices: [{ finish_reason: 'stop', message: { content: '' } }],
+    usage: { prompt_tokens: 10, completion_tokens: 1, total_tokens: 11 },
+  });
+  assert.strictEqual(empty.status, 'completed');
+  assert.strictEqual(empty.output.length, 1);
+  assert.strictEqual(empty.output[0].type, 'message');
+  assert.ok(empty.output[0].content[0].text.includes('上游返回了空响应'));
+
+  const filtered = c.chatCompletionToResponse({
+    id: 'chatcmpl_f',
+    choices: [{ finish_reason: 'content_filter', message: { content: '' } }],
+  });
+  assert.strictEqual(filtered.status, 'incomplete');
+  assert.strictEqual(filtered.incomplete_details.reason, 'content_filter');
+  assert.ok(filtered.output[0].content[0].text.includes('上游内容过滤拦截了输出'));
+
+  const pass = c.chatCompletionToResponse({
+    choices: [{ finish_reason: 'stop', message: { content: '' } }],
+  }, undefined, { emptyResponseMode: 'pass' });
+  assert.deepStrictEqual(pass.output, []);
+  assert.strictEqual(pass.status, 'completed');
 });
 
 console.log(`\nALL ${passed} TESTS PASSED`);

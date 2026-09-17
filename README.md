@@ -38,6 +38,8 @@ node server.js
 | `CONVERT_RESPONSES` | ❌ | 默认 `1`:把 `POST /v1/responses`(OpenAI Responses)请求转换为 Chat Completions 转发,响应再转换回 Responses 格式;设 `0` 关闭(该端点纯透传) |
 | `UPSTREAM_CHAT_PATH` | ❌ | chat completions 端点路径或完整 URL(可带 query,适配 Azure 风格)。默认由 `UPSTREAM_URL` 推导:路径以 `/v1` 结尾补 `/chat/completions`,否则补 `/v1/chat/completions` |
 | `ATTACH_REASONING` | ❌ | `1` 时转换把思考内容附挂到 assistant 消息的 `reasoning_content`,并为带 tool_calls 的 assistant 消息补占位(DeepSeek/Kimi 等思考型上游需要;严格 OpenAI 上游会拒绝该字段,默认关闭) |
+| `NORMALIZE_INLINE_SYSTEM` | ❌ | 默认 `1`:**只把 `messages[]` 的最后一条** `role:"system"` 按 `user` 发送。Claude Code CLI 会把后台任务通知(`<task-notification>`,文案含 "NOT USER INPUT"/"No human input has been received")以 `role:"system"` 追加在末尾 —— 上游 chat 模板遇到「末条 system + 声明无用户输入」会直接空响应(即上述 "Done 但没输出")。只改末条一条消息的 `role`(内容逐字不动),该位置之前的 prompt 前缀缓存不受影响。中间位置的 system(Claude Code 注入的环境 / `CLAUDE.md` / skills 上下文)保持 `system` 不动;设 `0` 关闭 |
+| `EMPTY_RESPONSE_MODE` | ❌ | 上游返回空响应(`finish_reason=stop`/`content_filter` 但整条流没有任何可见输出,思考型模型只吐 reasoning 或 Azure 内容过滤拦截时常见;客户端会表现为 **"Done 但没有输出"**)时的兜底:`text`(默认)补一段可见说明文本、`error` 报错中止本轮(Anthropic 发 `error` 事件,Responses 发 `response.failed`)、`pass` 原样透传(仅记录日志)。**两条协议(anthropic/responses)的流式与非流式转换都生效**;任何模式下都会打印上游原始 `finish_reason` 并落盘 `record.empty_response` |
 
 健康检查: `curl http://localhost:18080/healthz` → `ok`
 
@@ -170,6 +172,49 @@ Node 核心 `http`/`https` **不会自动读取代理环境变量**,gateway 已�
 - 写出后 `FIRST_BYTE_TIMEOUT_MS` 内无响应 → 上游服务器未响应
 - 日志中 `proxy : (direct)` 但网络要求代理 → 启动该 gateway 的 shell 没继承代理环境变量,加 `GATEWAY_PROXY` 即可(启动时也会有 WARN)
 
+客户端 (Claude Code / Codex CLI) 里显示 **"Done 但没有任何输出"**:
+- 看 gateway 日志里的 `[#n] upstream finish_reason: ...` 与 `[#n] [WARN] 上游空响应: ...`
+  —— 上游返回了 `200` 但整条流没有任何可见 `content`(只见 `thinking`/`reasoning`,或什么都没有)。
+  这类空响应的 `finish_reason` 是 `stop`(模型自己停)或 `content_filter`(Azure 内容过滤拦截),
+  后者在 Anthropic 侧映射成 `stop_reason=refusal`、在 Responses 侧映射成
+  `status=incomplete` + `incomplete_details.reason=content_filter`,而不是伪装成正常完成。
+- 默认 `EMPTY_RESPONSE_MODE=text` 会把空响应补成一段可见说明文本,避免客户端静默 "Done";
+  想让它直接报错可设 `EMPTY_RESPONSE_MODE=error`。
+- 若频繁出现,可配合 `LOG_FILE=/tmp/gw.jsonl` 抓 `response_body_upstream` 看到上游原始 SSE,
+  并试 `ATTACH_REASONING=1`(DeepSeek 系思考模型要求把历史 reasoning 回传)。
+
+Claude Code 的一个特有诱因(已实测复现,见下):后台任务通知被以 `role:"system"` 追加在
+`messages` 末尾。同一份请求体只把末条 `role` 从 `system` 改成 `user`,上游就从
+`completion_tokens:1, text_tokens:0`(空)变成正常 `tool_use` 输出;而保持 `system`
+角色但把通知文案换成中性的短句,也能正常生成 —— 即「末条 system 角色 + 声明无用户输入的文案」
+共同触发。默认开启的 `NORMALIZE_INLINE_SYSTEM=1` 会把**末条**这类消息按 `user` 发送,
+日志会打印 `[#n] 末条消息 role=system (messages[] 内共 N 条 system, 中间位置的保持 system) → 已按 user 发送`。
+之所以只动末条: 同一份请求里中间位置还有若干 Claude Code 注入的 system 上下文
+(环境信息 / `CLAUDE.md` / skills 列表), 它们在历史里一直是 system 且上游能正常接续生成,
+保留 system 权重更稳, 也避免因为改 role 让该位置之后的 prompt 缓存整段失效。
+
+若真的拿到空响应, 日志除了原来的 `[#n] [WARN] 上游空响应:` 之外, 还会额外打印出站消息末段,
+直接指出是哪条 prompt 触发的:
+
+```
+[#16] [WARN] 上游空响应: finish_reason=stop, 没有任何可见输出 (兜底策略=text)
+[#16]        出站末段 #154 tool(1234B): ...
+[#16]        出站末段 #155 assistant(56B): ...
+[#16]        出站末段 #156 system(1532B): [SYSTEM NOTIFICATION - NOT USER INPUT] …
+```
+
+A/B 实测记录(`deepseek-v4-flash-0731`,同一份 131 条消息的历史请求):
+
+| 变体 | 末条 role / 内容 | 结果 |
+| --- | --- | --- |
+| A | `system` / 通知原文 | 空响应,`output_tokens:1`(2/2 复现) |
+| B | `user` / 通知原文 | 正常生成,`tool_use`,`output_tokens:532`(2/2) |
+| C | `system` / 中性短句 | 正常生成,`output_tokens:400` |
+| E | `system` / 仅 `<task-notification>` 块 | 空响应,`output_tokens:1` |
+| F | `system` / 仅 "NOT USER INPUT" 前言 | 只出 thinking,无可见正文(`output_tokens:51`) |
+
+即空响应不是 `finish_reason=content_filter` 导致的(这几例都是 `stop`)。
+
 无需任何配置,gateway 会自动继承 shell 中预设的代理环境变量(与 curl/Claude Code 行为一致)。
 
 ## 实现说明
@@ -192,6 +237,13 @@ UPSTREAM_URL=http://localhost:9001 UPSTREAM_TOKEN=test-token node server.js
 curl -N -X POST http://localhost:18080/v1/messages -H 'content-type: application/json' \
   -d '{"stream":true,"messages":[{"role":"user","content":"hi"}]}'
 # 纯透传回归需关闭转换: CONVERT_ANTHROPIC=0 CONVERT_RESPONSES=0 ...
+```
+
+回归样本: `temp/repro-156/` 是「末条 `role:"system"` 触发空响应」的最小复现
+(2KB, 只差一个 role 字段), 用法和实测记录见 `temp/repro-156/README.md`:
+
+```bash
+./temp/repro-156/run.sh http://127.0.0.1:18080
 ```
 
 ## 注意事项

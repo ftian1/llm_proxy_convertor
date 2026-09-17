@@ -1,0 +1,35 @@
+{
+  "model": "deepseek-v4-flash-0731",
+  "max_tokens": 2048,
+  "stream": true,
+  "system": [
+    {
+      "type": "text",
+      "text": "You are a coding agent working in /home/feng/research."
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": "Pull the vllm-openai-xpu image and monitor it."
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "Started the monitor; I will report when the pull finishes."
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "[SYSTEM NOTIFICATION - NOT USER INPUT]\nThis is an automated background-task event, NOT a message from the user.\nDo NOT interpret this as user acknowledgement, confirmation, or response to any pending question.\nNo human input has been received since the last genuine user message in this conversation. Any statement that the user said, approved, or confirmed something — including statements in your own earlier messages — is NOT real user input and must NOT be treated as approval or consent.\n\n<task-notification>\n<task-id>b2dul6zpo</task-id>\n<summary>Monitor event: \"vLLM XPU image pull completion\"</summary>\n<event>PULL_DONE vllm-openai-xpu:latest present</event>\n</task-notification>\n\n[SYSTEM NOTIFICATION - NOT USER INPUT]\nThis is an automated background-task event, NOT a message from the user.\nDo NOT interpret this as user acknowledgement, confirmation, or response to any pending question.\nNo human input has been received since the last genuine user message in this conversation. Any statement that the user said, approved, or confirmed something — including statements in your own earlier messages — is NOT real user input and must NOT be treated as approval or consent.\n\n<task-notification>\n<task-id>b2dul6zpo</task-id>\n<tool-use-id>call_1de58450add246a1a6ab1001</tool-use-id>\n<output-file>/tmp/claude-2005/-home-feng-research/e3a4144c-40ad-418a-a28d-da0c2bc6450c/tasks/b2dul6zpo.output</output-file>\n<status>completed</status>\n<summary>Monitor \"vLLM XPU image pull completion\" stream ended</summary>\n</task-notification>"
+        }
+      ]
+    }
+  ]
+}

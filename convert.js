@@ -314,6 +314,20 @@ function toolOutputContent(content) {
 }
 
 // 单条 Anthropic 消息 -> 多条 chat 消息 (tool_result 拆成独立 tool 消息)
+// Claude Code CLI 会把「后台任务通知」以 role:"system" 追加在 messages 末尾。上游 chat
+// 模板遇到「末条 system + 文案声明无用户输入」时会直接空响应 (finish_reason=stop, 只有
+// 1 个 reasoning token, 无任何可见 content), Claude Code TUI 于是显示 Done 却没有输出。
+// 同一份请求体只把末条 role 改成 user 即可正常生成 (README troubleshooting 有 A/B 记录)。
+//
+// 只归一「末条」这一条: 中间位置的 system 消息 (Claude Code 注入的环境 / CLAUDE.md /
+// skills 上下文) 一直是 system, 上游能正常接续生成, 保留其 system 权重更安全, 也不会
+// 因为改 role 而使该位置之后的 prompt 前缀缓存全部失效。NORMALIZE_INLINE_SYSTEM=0 关闭。
+function normalizeInlineSystemRole(msg, opts, isLast) {
+  const role = (msg && msg.role) || 'user';
+  if (isLast && role === 'system' && opts.normalizeInlineSystem !== false) return 'user';
+  return role;
+}
+
 function convertMessageToOpenAI(role, content, opts) {
   const result = [];
   if (content === undefined || content === null) {
@@ -426,9 +440,11 @@ function anthropicToOpenAI(body, opts = {}) {
   }
 
   if (Array.isArray(body.messages)) {
-    for (const msg of body.messages) {
-      const role = (msg && msg.role) || 'user';
-      messages.push(...convertMessageToOpenAI(role, msg && msg.content, opts));
+    const lastIndex = body.messages.length - 1;
+    for (let i = 0; i < body.messages.length; i += 1) {
+      const msg = body.messages[i];
+      messages.push(...convertMessageToOpenAI(
+        normalizeInlineSystemRole(msg, opts, i === lastIndex), msg && msg.content, opts));
     }
   }
   result.messages = messages;
@@ -497,8 +513,47 @@ function mapStopReason(finishReason) {
     case 'function_call': return 'tool_use';
     case 'stop': return 'end_turn';
     case 'length': return 'max_tokens';
+    // Azure/OpenAI 内容过滤: 上游 200 + 空 content + finish_reason=content_filter。
+    // 不能落进 default 被当成正常 end_turn, 否则客户端只看到 "Done 但无输出"
+    case 'content_filter': return 'refusal';
     default: return 'end_turn';
   }
+}
+
+// ---------------------------------------------------------------------------
+// 空响应兜底 (两条响应协议共用)
+// 上游以 finish_reason=stop / content_filter 收尾, 但整条流没有任何"可见输出"
+// (思考型模型只吐 reasoning 就停; Azure 内容过滤把 content 清空却仍返回 200)。
+// 不兜底的话客户端只会静默 "Done 但没有输出", 完全看不出发生了什么。
+// ---------------------------------------------------------------------------
+
+// 兜底策略: text (默认) 补一段可见说明文本 | error 报错中止本轮 | pass 原样透传
+const EMPTY_RESPONSE_MODES = new Set(['text', 'error', 'pass']);
+
+function normalizeEmptyResponseMode(mode) {
+  return EMPTY_RESPONSE_MODES.has(mode) ? mode : 'text';
+}
+
+// detail 形如 "stop_reason=end_turn, output_tokens=1"
+function emptyResponseNote(detail, finishReason) {
+  const cause = finishReason === 'content_filter'
+    ? '上游内容过滤拦截了输出'
+    : '思考型模型只产出 reasoning 就停止 (或上游直接返回了空 completion)';
+  return `[gateway] 上游返回了空响应: 没有任何可见输出 (${detail})。`
+    + `原因: ${cause}; 建议重试或更换模型。`;
+}
+
+// Responses 输出里是否存在"可见"内容项 (reasoning 项不算)
+function responseOutputHasVisibleItem(output) {
+  return output.some((item) => {
+    if (['function_call', 'custom_tool_call', 'tool_search_call'].includes(item.type)) return true;
+    if (item.type === 'message' && Array.isArray(item.content)) {
+      return item.content.some((part) =>
+        (part.type === 'output_text' && typeof part.text === 'string' && part.text.trim() !== '')
+        || part.type === 'refusal');
+    }
+    return false;
+  });
 }
 
 /**
@@ -608,8 +663,12 @@ function chatErrorToAnthropicError(body) {
 // 对应 cc-switch streaming.rs::create_anthropic_sse_stream
 // ---------------------------------------------------------------------------
 
+// 合成的 thinking 签名: 上游是 OpenAI 兼容接口, 本来就没有真签名,
+// 这里只保证 Anthropic 协议要求的 signature_delta 字段存在
+const SYNTHETIC_THINKING_SIGNATURE = 'bGxtLWdhdGV3YXk=';
+
 class AnthropicStreamConverter {
-  constructor() {
+  constructor(opts = {}) {
     this.messageId = null;
     this.currentModel = null;
     this.nextContentIndex = 0;
@@ -624,6 +683,12 @@ class AnthropicStreamConverter {
     this.currentNonToolBlockIndex = null;
     this.toolBlocks = new Map(); // chat index -> 状态
     this.openToolBlockIndices = new Set();
+    this.emptyResponseMode = normalizeEmptyResponseMode(opts.emptyResponseMode);
+    // 可见输出 = text / tool_use 块; thinking 不算 (客户端默认折叠, 计数为空回答)
+    this.hasEmittedVisibleBlock = false;
+    // 供网关日志/落盘使用: 上游原始 finish_reason 与是否命中空响应兜底
+    this.upstreamFinishReason = null;
+    this.emptyResponseDetected = false;
   }
 
   frame(event, obj) {
@@ -634,6 +699,14 @@ class AnthropicStreamConverter {
   stopNonToolBlock() {
     const out = [];
     if (this.currentNonToolBlockIndex !== null) {
+      // Anthropic 的 thinking 块以 signature_delta 收尾, 缺失时部分客户端会丢弃整块
+      if (this.currentNonToolBlockType === 'thinking') {
+        out.push(this.frame('content_block_delta', {
+          type: 'content_block_delta',
+          index: this.currentNonToolBlockIndex,
+          delta: { type: 'signature_delta', signature: SYNTHETIC_THINKING_SIGNATURE }
+        }));
+      }
       out.push(this.frame('content_block_stop', {
         type: 'content_block_stop',
         index: this.currentNonToolBlockIndex
@@ -649,6 +722,13 @@ class AnthropicStreamConverter {
     const out = [];
     if (data.trim() === '[DONE]') {
       // 流正常结束: 发出缓存的 message_delta (含完整 usage) + message_stop
+      const fallback = this.emptyResponseFallback();
+      if (fallback && fallback.terminalError) {
+        this.pendingMessageDelta = null;
+        this.hasSentMessageStop = true; // 已用 error 事件收尾, 不再补 message_stop
+        return fallback.frames;
+      }
+      if (fallback) out.push(...fallback.frames);
       if (this.pendingMessageDelta) {
         out.push(this.frame('message_delta', {
           type: 'message_delta',
@@ -740,6 +820,7 @@ class AnthropicStreamConverter {
         }));
         this.currentNonToolBlockType = 'text';
         this.currentNonToolBlockIndex = index;
+        this.hasEmittedVisibleBlock = true;
       }
       out.push(this.frame('content_block_delta', {
         type: 'content_block_delta',
@@ -789,6 +870,7 @@ class AnthropicStreamConverter {
             content_block: { type: 'tool_use', id: state.id, name: state.name }
           }));
           this.openToolBlockIndices.add(state.anthropicIndex);
+          this.hasEmittedVisibleBlock = true;
         }
         if (pendingAfterStart !== '') {
           out.push(this.frame('content_block_delta', {
@@ -809,6 +891,7 @@ class AnthropicStreamConverter {
 
     // finish_reason: 只缓存 message_delta, 等 [DONE] 统一发出 (保证 usage 完整且只发一次)
     if (choice.finish_reason) {
+      this.upstreamFinishReason = choice.finish_reason;
       const stopReason = mapStopReason(choice.finish_reason);
       if (!this.hasEmittedMessageDelta) {
         this.hasEmittedMessageDelta = true;
@@ -835,6 +918,7 @@ class AnthropicStreamConverter {
             content_block: { type: 'tool_use', id, name }
           }));
           this.openToolBlockIndices.add(index);
+          this.hasEmittedVisibleBlock = true;
           if (pending !== '') {
             out.push(this.frame('content_block_delta', {
               type: 'content_block_delta',
@@ -862,11 +946,70 @@ class AnthropicStreamConverter {
     return out;
   }
 
+  // 上游以 finish_reason=stop 收尾, 但整条流没有任何可见块时的兜底。
+  // 触发场景: 思考型模型只产出 reasoning 后直接停止; Azure/OpenAI 内容过滤
+  // 把 content 清空却仍返回 200。返回 null 表示无需兜底。
+  emptyResponseFallback() {
+    if (this.hasEmittedVisibleBlock) return null;
+    const pending = this.pendingMessageDelta;
+    if (!pending) return null;
+    const stopReason = pending.stopReason;
+    if (stopReason !== 'end_turn' && stopReason !== 'refusal') return null;
+
+    // 无论哪种兜底策略都记录下来, 便于网关日志/落盘诊断
+    this.emptyResponseDetected = true;
+    if (this.emptyResponseMode === 'pass') return null;
+
+    const usage = pending.usage || {};
+    const detail = `stop_reason=${stopReason}, finish_reason=${this.upstreamFinishReason || '?'}`
+      + `, output_tokens=${usage.output_tokens || 0}`;
+
+    if (this.emptyResponseMode === 'error') {
+      return {
+        terminalError: true,
+        frames: [this.frame('error', {
+          type: 'error',
+          error: {
+            type: 'api_error',
+            message: `upstream returned no visible output (${detail})`
+          }
+        })]
+      };
+    }
+
+    const index = this.nextContentIndex++;
+    const text = emptyResponseNote(detail, this.upstreamFinishReason);
+    this.hasEmittedVisibleBlock = true;
+    return {
+      terminalError: false,
+      frames: [
+        this.frame('content_block_start', {
+          type: 'content_block_start',
+          index,
+          content_block: { type: 'text', text: '' }
+        }),
+        this.frame('content_block_delta', {
+          type: 'content_block_delta',
+          index,
+          delta: { type: 'text_delta', text }
+        }),
+        this.frame('content_block_stop', { type: 'content_block_stop', index })
+      ]
+    };
+  }
+
   // 流结束但没收到 [DONE]: 补发缓存的 message_delta 和 message_stop
   flush() {
     const out = [];
     let emitted = false;
     if (this.pendingMessageDelta) {
+      const fallback = this.emptyResponseFallback();
+      if (fallback && fallback.terminalError) {
+        this.pendingMessageDelta = null;
+        this.hasSentMessageStop = true;
+        return fallback.frames;
+      }
+      if (fallback) out.push(...fallback.frames);
       out.push(this.frame('message_delta', {
         type: 'message_delta',
         delta: {
@@ -1542,7 +1685,14 @@ function responseIdFromChatId(id) {
 }
 
 function responseStatusFromFinishReason(finishReason) {
-  return finishReason === 'length' ? 'incomplete' : 'completed';
+  // length: 被 max_output_tokens 截断; content_filter: 上游把 content 清空却仍返回 200。
+  // 两者都不能算正常完成
+  return (finishReason === 'length' || finishReason === 'content_filter') ? 'incomplete' : 'completed';
+}
+
+// incomplete_details.reason (Responses 协议里 content_filter 是合法的 incomplete 原因)
+function responseIncompleteReason(finishReason) {
+  return finishReason === 'content_filter' ? 'content_filter' : 'max_output_tokens';
 }
 
 // <think>...</think> 前缀拆分: 返回 [reasoning, answer] 或 null
@@ -1648,7 +1798,7 @@ function chatErrorToResponseError(body) {
  * Chat Completions 响应 -> Responses 响应 (非流式)
  * 对应 cc-switch transform_codex_chat.rs::chat_completion_to_response_with_context
  */
-function chatCompletionToResponse(body, toolContext) {
+function chatCompletionToResponse(body, toolContext, opts = {}) {
   const ctx = toolContext || new ToolContext();
   const choices = body && body.choices;
   if (!Array.isArray(choices) || choices.length === 0) {
@@ -1743,6 +1893,21 @@ function chatCompletionToResponse(body, toolContext) {
     );
   }
 
+  // 空响应兜底: 上游正常收尾但没有任何可见输出 (只有 reasoning 或完全为空)
+  const emptyMode = normalizeEmptyResponseMode(opts.emptyResponseMode);
+  // (length 截断有自己的 incomplete 语义, 不在此兜底)
+  if (finishReason !== 'length' && emptyMode !== 'pass' && !responseOutputHasVisibleItem(output)) {
+    const detail = `finish_reason=${finishReason || '?'}, `
+      + `output_tokens=${(body.usage && body.usage.completion_tokens) || 0}`;
+    output.push({
+      id: `${responseId}_msg`,
+      type: 'message',
+      status: 'completed',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: emptyResponseNote(detail, finishReason), annotations: [] }]
+    });
+  }
+
   const response = {
     id: responseId,
     object: 'response',
@@ -1752,8 +1917,8 @@ function chatCompletionToResponse(body, toolContext) {
     output,
     usage: chatUsageToResponsesUsage(body.usage)
   };
-  if (finishReason === 'length') {
-    response.incomplete_details = { reason: 'max_output_tokens' };
+  if (status === 'incomplete') {
+    response.incomplete_details = { reason: responseIncompleteReason(finishReason) };
   }
   return response;
 }
@@ -1821,6 +1986,7 @@ class ResponsesStreamConverter {
   constructor(toolContext = new ToolContext(), opts = {}) {
     this.toolContext = toolContext;
     this.attachReasoning = !!opts.attachReasoning;
+    this.emptyResponseMode = normalizeEmptyResponseMode(opts.emptyResponseMode);
     this.responseStarted = false;
     this.completed = false;
     this.failed = false;
@@ -1838,6 +2004,9 @@ class ResponsesStreamConverter {
     this.latestUsage = null;
     this.finishReason = null;
     this.droppedToolCalls = 0;
+    // 供网关日志/落盘使用: 上游原始 finish_reason 与是否命中空响应兜底
+    this.upstreamFinishReason = null;
+    this.emptyResponseDetected = false;
   }
 
   baseResponse(status, output) {
@@ -2118,6 +2287,35 @@ class ResponsesStreamConverter {
       ['function_call', 'custom_tool_call', 'tool_search_call'].includes(e.item.type));
   }
 
+  // 可见输出 = 文本 / 工具调用 (reasoning 项不算: 客户端不把它当回复正文)
+  hasVisibleOutput() {
+    return this.text.text.trim() !== '' || this.hasEmittedToolCall();
+  }
+
+  // 上游正常收尾但整条流没有任何可见输出时的兜底。返回 null 表示无需兜底。
+  emptyResponseFallback() {
+    if (this.hasVisibleOutput()) return null;
+    if (this.finishReason === 'length') return null; // 截断有自己的 incomplete 语义
+    this.emptyResponseDetected = true;
+    if (this.emptyResponseMode === 'pass') return null;
+
+    const detail = `finish_reason=${this.finishReason || '?'}, `
+      + `output_tokens=${(this.latestUsage && this.latestUsage.output_tokens) || 0}`;
+    if (this.emptyResponseMode === 'error') {
+      return {
+        terminalError: true,
+        frames: [this.failedEvent(
+          `upstream returned no visible output (${detail})`,
+          'upstream_empty_response'
+        )]
+      };
+    }
+    return {
+      terminalError: false,
+      frames: this.pushTextDelta(emptyResponseNote(detail, this.finishReason))
+    };
+  }
+
   finalizeReasoning() {
     if (!this.reasoning.added || this.reasoning.done) return [];
     const outputIndex = this.reasoning.outputIndex;
@@ -2228,9 +2426,17 @@ class ResponsesStreamConverter {
       return out;
     }
 
+    // 空响应兜底: 上游正常收尾但没有任何可见输出 (只有 reasoning 或完全为空)
+    const fallback = this.emptyResponseFallback();
+    if (fallback) {
+      out.push(...fallback.frames);
+      if (fallback.terminalError) return out;
+      out.push(...this.finalizeText()); // 把刚补出来的 text 项收尾
+    }
+
     const response = this.baseResponse(status, this.completedOutputItems());
     if (status === 'incomplete') {
-      response.incomplete_details = { reason: 'max_output_tokens' };
+      response.incomplete_details = { reason: responseIncompleteReason(this.finishReason) };
     }
     out.push(sseEventFrame('response.completed', { type: 'response.completed', response }));
     this.completed = true;
@@ -2288,6 +2494,7 @@ class ResponsesStreamConverter {
     }
     if (typeof choice.finish_reason === 'string') {
       this.finishReason = choice.finish_reason;
+      this.upstreamFinishReason = choice.finish_reason;
     }
     return out;
   }
