@@ -38,8 +38,9 @@ node server.js
 | `CONVERT_RESPONSES` | ❌ | 默认 `1`:把 `POST /v1/responses`(OpenAI Responses)请求转换为 Chat Completions 转发,响应再转换回 Responses 格式;设 `0` 关闭(该端点纯透传) |
 | `UPSTREAM_CHAT_PATH` | ❌ | chat completions 端点路径或完整 URL(可带 query,适配 Azure 风格)。默认由 `UPSTREAM_URL` 推导:路径以 `/v1` 结尾补 `/chat/completions`,否则补 `/v1/chat/completions` |
 | `ATTACH_REASONING` | ❌ | `1` 时转换把思考内容附挂到 assistant 消息的 `reasoning_content`,并为带 tool_calls 的 assistant 消息补占位(DeepSeek/Kimi 等思考型上游需要;严格 OpenAI 上游会拒绝该字段,默认关闭) |
-| `NORMALIZE_INLINE_SYSTEM` | ❌ | 默认 `1`:**只把 `messages[]` 的最后一条** `role:"system"` 按 `user` 发送。Claude Code CLI 会把后台任务通知(`<task-notification>`,文案含 "NOT USER INPUT"/"No human input has been received")以 `role:"system"` 追加在末尾 —— 上游 chat 模板遇到「末条 system + 声明无用户输入」会直接空响应(即上述 "Done 但没输出")。只改末条一条消息的 `role`(内容逐字不动),该位置之前的 prompt 前缀缓存不受影响。中间位置的 system(Claude Code 注入的环境 / `CLAUDE.md` / skills 上下文)保持 `system` 不动;设 `0` 关闭 |
-| `EMPTY_RESPONSE_MODE` | ❌ | 上游返回空响应(`finish_reason=stop`/`content_filter` 但整条流没有任何可见输出,思考型模型只吐 reasoning 或 Azure 内容过滤拦截时常见;客户端会表现为 **"Done 但没有输出"**)时的兜底:`text`(默认)补一段可见说明文本、`error` 报错中止本轮(Anthropic 发 `error` 事件,Responses 发 `response.failed`)、`pass` 原样透传(仅记录日志)。**两条协议(anthropic/responses)的流式与非流式转换都生效**;任何模式下都会打印上游原始 `finish_reason` 并落盘 `record.empty_response` |
+| `NORMALIZE_INLINE_SYSTEM` | ❌ | 默认 `1`:**`messages[]` 内所有** `role:"system"` 一律按 `user` 发送(内容逐字不动,只改 `role`)。Claude Code 会把两类 system 混进 `messages[]`:末尾的后台任务通知(`<task-notification>`,文案含 "NOT USER INPUT"/"No human input has been received")—— 上游 chat 模板遇到「末条 system + 声明无用户输入」会直接空响应(即上述 "Done 但没输出");中间位置的环境 / `CLAUDE.md` / skills 上下文 —— 部分上游(Qwen 兼容接口)对非首位 system 直接 400 `System message must be at the beginning.`。顶层 `system` 参数转出的 system 消息固定在最前,不受影响;设 `0` 关闭 |
+| `EMPTY_RESPONSE_MODE` | ❌ | 上游返回空响应(`finish_reason=stop`/`content_filter` 但整条流没有任何可见输出,思考型模型只吐 reasoning 或 Azure 内容过滤拦截时常见;客户端会表现为 **"Done 但没有输出"**)时的兜底。**一般不用设**,默认 `auto` 已覆盖思考型模型的场景:`auto`(默认)手里有思考内容就**当正文回吐**(思考型模型把整段答案写进 reasoning 通道就停时,直接把这一轮救回来),没有可回吐的则补一段可见说明文本;`text` 一律补说明文本;`error` 报错中止本轮(Anthropic 发 `error` 事件,Responses 发 `response.failed`;**仅流式** — 非流式没有 SSE 通道可发 error 事件,行为同 `text`);`pass` 原样透传(仅记录日志)。**两条协议(anthropic/responses)的流式与非流式转换都生效**;任何模式下都会打印上游原始 `finish_reason`、模型名并落盘 `record.empty_response` |
+| `EMPTY_RESPONSE_RETRIES` | ❌ | 上游返回**「完全空」响应**(零内容、零思考就 `finish_reason=stop`,或零字节断流 —— `deepseek-v4-pro` 长上下文偶发)时的**透明重试**次数,默认 `1`(最多重试一次、共两次尝试),设 `0` 关闭(上限 `3`)。**仅流式转换生效**:`message_start`/`response.created` 延迟到第一个真实 delta 才发,所以空响应在客户端眼里是零字节,重试对客户端完全无感知;重试拿到正常响应时客户端直接得到真答案,重试次数用尽才走 `EMPTY_RESPONSE_MODE` 的兜底。`content_filter` 拦截不重试(重试无意义);只吐 reasoning 的空响应由 `auto` 回吐思考内容,也不重试 |
 
 健康检查: `curl http://localhost:18080/healthz` → `ok`
 
@@ -92,7 +93,7 @@ node server.js
 
 其它路径(如 `/v1/models`、`/v1/messages/count_tokens`)不受影响,始终透传。
 
-回归测试: `node test-convert.js`(零依赖,20 个用例)。
+回归测试: `node test-convert.js`(零依赖,41 个用例)。
 
 ## 客户端配置
 
@@ -178,8 +179,20 @@ Node 核心 `http`/`https` **不会自动读取代理环境变量**,gateway 已�
   这类空响应的 `finish_reason` 是 `stop`(模型自己停)或 `content_filter`(Azure 内容过滤拦截),
   后者在 Anthropic 侧映射成 `stop_reason=refusal`、在 Responses 侧映射成
   `status=incomplete` + `incomplete_details.reason=content_filter`,而不是伪装成正常完成。
-- 默认 `EMPTY_RESPONSE_MODE=text` 会把空响应补成一段可见说明文本,避免客户端静默 "Done";
-  想让它直接报错可设 `EMPTY_RESPONSE_MODE=error`。
+- 默认 `EMPTY_RESPONSE_MODE=auto` 会自动兜底:手里有思考内容就**当正文回吐**(见下节 ——
+  思考型模型把整段答案写进 reasoning 通道时,这一轮直接救回来),没有可回吐的才补一段可见
+  说明文本,客户端不会静默 "Done"。**判断依据是这条响应本身,不是模型名**: 走到兜底这一步
+  就说明整条流没有任何可见输出,此时还有思考内容 => 这个模型刚把答案写进了思考通道。
+  实测 `deepseek-v4-flash-0731` 有 49% 的响应在吐 reasoning(也是思考模型)却 592 次请求
+  0 次空响应,`deepseek-v4-pro` 是 76% / 40 次 —— 模型名区分不出这两者,且将来出新模型
+  也不用维护名单。想强制只补说明文本设 `EMPTY_RESPONSE_MODE=text`,
+  想直接报错设 `EMPTY_RESPONSE_MODE=error`(仅流式)。
+- 默认 `EMPTY_RESPONSE_RETRIES=1` 会在**流式转换**下先做透明重试:「完全空」响应
+  (连思考都没有,`finish_reason=stop` 或零字节断流)在客户端眼里一个字节都没发出过,
+  网关会原样重发上游请求(最多重试 1 次),日志打印
+  `[#n] [WARN] 上游空响应 (finish_reason=stop, 客户端零字节已写出) — 透明重试 1/1`;
+  重试拿到正常响应时客户端直接得到真答案,你感知不到发生过空响应。重试次数用尽或
+  设 `EMPTY_RESPONSE_RETRIES=0` 才落到 `EMPTY_RESPONSE_MODE` 兜底。
 - 若频繁出现,可配合 `LOG_FILE=/tmp/gw.jsonl` 抓 `response_body_upstream` 看到上游原始 SSE,
   并试 `ATTACH_REASONING=1`(DeepSeek 系思考模型要求把历史 reasoning 回传)。
 
@@ -187,11 +200,12 @@ Claude Code 的一个特有诱因(已实测复现,见下):后台任务通知被�
 `messages` 末尾。同一份请求体只把末条 `role` 从 `system` 改成 `user`,上游就从
 `completion_tokens:1, text_tokens:0`(空)变成正常 `tool_use` 输出;而保持 `system`
 角色但把通知文案换成中性的短句,也能正常生成 —— 即「末条 system 角色 + 声明无用户输入的文案」
-共同触发。默认开启的 `NORMALIZE_INLINE_SYSTEM=1` 会把**末条**这类消息按 `user` 发送,
-日志会打印 `[#n] 末条消息 role=system (messages[] 内共 N 条 system, 中间位置的保持 system) → 已按 user 发送`。
-之所以只动末条: 同一份请求里中间位置还有若干 Claude Code 注入的 system 上下文
-(环境信息 / `CLAUDE.md` / skills 列表), 它们在历史里一直是 system 且上游能正常接续生成,
-保留 system 权重更稳, 也避免因为改 role 让该位置之后的 prompt 缓存整段失效。
+共同触发。默认开启的 `NORMALIZE_INLINE_SYSTEM=1` 会把 `messages[]` 内这类消息**全部**按
+`user` 发送,日志会打印 `[#n] messages[] 内含 N 条 role=system → 全部按 user 发送`。
+中间位置的 system(Claude Code 注入的环境 / `CLAUDE.md` / skills 上下文)也一并归一:
+曾按原样保留以保前缀缓存,但实测有上游(Qwen 兼容接口)对非首位 system 直接
+`400 BadRequestError: System message must be at the beginning.`,客户端重试多少次都一样 ——
+空响应只是质量退化,400 是整轮不可用,两害相权取后者修复。
 
 若真的拿到空响应, 日志除了原来的 `[#n] [WARN] 上游空响应:` 之外, 还会额外打印出站消息末段,
 直接指出是哪条 prompt 触发的:
@@ -215,6 +229,51 @@ A/B 实测记录(`deepseek-v4-flash-0731`,同一份 131 条消息的历史请求
 
 即空响应不是 `finish_reason=content_filter` 导致的(这几例都是 `stop`)。
 
+另一类空响应(与上面这条**无关**,触发条件完全不同):超长上下文下思考型模型把整段答案
+写进 reasoning 通道就 `stop`,`content` 为空。同一份 `gateway.log` 的统计
+(1988 次响应 / 40 次空响应,上游是 LiteLLM 转发的 Azure `DeepSeek-V4-Pro`):
+
+| 上游 `cache_read_input_tokens` | 空响应 | 正常 | 失败率 |
+| --- | --- | --- | --- |
+| < 300k | 0 | 204 | 0% |
+| 300k–500k | 6 | 341 | 1.7% |
+| 500k–700k | 18 | 371 | 4.6% |
+| 700k–900k | 14 | 73 | **16.1%** |
+
+- 40 次**全部**落在 `DeepSeek-V4-Pro`;`deepseek-v4-flash-0731` 592 次 0 次 —— 但 flash
+  几乎没跑过这么长的上下文(≥300k 只有 2 次),所以这只能算"值得 A/B",不算已证明。
+- 与 `NORMALIZE_INLINE_SYSTEM` 那条无关: 60 次触发末条 system 归一的请求,空响应 0 次。
+- 失败样本的 reasoning 读起来就是完整答复(`## 回答` 标题、markdown 表格、代码块齐全),
+  所以默认的 `auto` 兜底(把思考内容当正文回吐)能直接把这一轮救回来。
+- 请求体 3.0MB / prompt 约 735k tokens 是常态。**压上下文(`/compact`、开新会话)是唯一
+  能压住根因的办法** —— 触发概率随上下文长度陡增,换模型/兜底都只是缓解。
+- 上游这一层(LiteLLM)不会帮忙: 它把 `reasoning_content` 与 `content` 分开透传,
+  `content` 为空且 `finish_reason=stop` 时照样当成成功完成,不报错、不重试
+  (参见 BerriAI/litellm#38199)。它自带的 `merge_reasoning_content_in_choices` 是**默认关闭**
+  的全局开关,且会把思考包成 `<think>…</think>` 塞进正文(给 OpenWebUI 那类 UI 用的),
+  与这里的按需回吐不是一回事。
+
+### 再一类: 上游断流(没有 `finish_reason`、也没有 `[DONE]`)
+
+同一条退化路径上还有更狠的一种 —— 上游(通常是模型返回**完全空的 completion**,连 reasoning
+都没有)连 `finish_reason` 都不发就把 SSE 连接关了。日志里的特征很干净: 该请求只有
+`RESP #N <- 200 OK` 和一条 `event: message_start`,之后再无任何事件;搜 `client disconnected`
+是 0 次(所以不是客户端断开),而 `message_start` 之后的**下一个** `[#M] upstream normalize`
+就是下一条请求了。
+
+Anthropic 侧原本在收尾时(`convert.js` 的 `AnthropicStreamConverter.flush()`)发现
+`pendingMessageDelta` 为空就什么都不发,客户端只收到一个"只有 `message_start` 就断掉"的流:
+**不报错、也没有完成事件,Claude Code 表现为 query 静默停住、不提示完成**。现在已对齐
+Responses 侧的 `stream_truncated` 语义(无条件生效,不受 `EMPTY_RESPONSE_MODE` 影响):
+
+| 断流时的情况 | 出站收尾 |
+| --- | --- |
+| 一个字都没出 | 发 Anthropic `error` 事件(`stream_error`,含 `stream_truncated`),客户端报错并重试 |
+| 已经出过可见正文/工具调用 | 补 `content_block_stop`,按 `stop_reason=max_tokens` 正常收尾,客户端可据此续写 |
+
+判定"断流"的依据是: 没收到 `finish_reason`、也没收到 `[DONE]`、且从未发出过 `message_stop`。
+三种收尾(正常 `[DONE]`、空响应兜底、断流)互斥,已有回归用例覆盖。
+
 无需任何配置,gateway 会自动继承 shell 中预设的代理环境变量(与 curl/Claude Code 行为一致)。
 
 ## 实现说明
@@ -237,6 +296,22 @@ UPSTREAM_URL=http://localhost:9001 UPSTREAM_TOKEN=test-token node server.js
 curl -N -X POST http://localhost:18080/v1/messages -H 'content-type: application/json' \
   -d '{"stream":true,"messages":[{"role":"user","content":"hi"}]}'
 # 纯透传回归需关闭转换: CONVERT_ANTHROPIC=0 CONVERT_RESPONSES=0 ...
+
+# 空响应兜底回归: mock 只吐 reasoning_content、没有任何可见 content 就 stop
+# 默认 auto 即回吐思考内容, 无需配置; 追加 EMPTY_RESPONSE_MODE=text/error/pass 对比其余策略
+MOCK_CHAT_REASONING_ONLY=1 node mock-upstream.js 9001
+UPSTREAM_URL=http://localhost:9001 UPSTREAM_TOKEN=test-token node server.js
+
+# 透明重试回归: mock 第一个流式请求返回「完全空」响应 (零 delta 就 stop), 之后恢复正常
+# 默认 EMPTY_RESPONSE_RETRIES=1: 客户端拿到的直接是真响应, 网关日志里有 "透明重试 1/1";
+# 追加 EMPTY_RESPONSE_RETRIES=0 对比关闭重试时客户端收到 [gateway] 说明文本
+MOCK_CHAT_EMPTY_ONCE=1 node mock-upstream.js 9001
+UPSTREAM_URL=http://localhost:9001 UPSTREAM_TOKEN=test-token node server.js
+
+# 上游断流回归: mock 发一个 chunk 就关流 (无 finish_reason、无 [DONE])
+# 客户端应收到 event: error (stream_truncated), 而不是只有 message_start 的静默断流
+MOCK_CHAT_TRUNCATE=1 node mock-upstream.js 9001
+UPSTREAM_URL=http://localhost:9001 UPSTREAM_TOKEN=test-token node server.js
 ```
 
 回归样本: `temp/repro-156/` 是「末条 `role:"system"` 触发空响应」的最小复现

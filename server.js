@@ -27,11 +27,22 @@
  *   ATTACH_REASONING=1   可选, 转换时把思考内容附到 assistant 消息的 reasoning_content
  *                        (DeepSeek/Kimi 等思考型上游要求; 严格 OpenAI 上游会拒绝该字段, 默认关闭)
  *   EMPTY_RESPONSE_MODE  可选, 上游返回空响应 (finish_reason=stop 但没有任何可见 content,
- *                        思考型模型只吐 reasoning、或 Azure 内容过滤拦截时常见) 的兜底方式:
- *                        text 补一段可见说明文本 (默认) | error 报错中止本轮 (Anthropic 发
- *                        error 事件, Responses 发 response.failed) | pass 原样透传
- *                        (客户端会表现为 "Done 但没有输出")。两条协议 (anthropic/responses)
- *                        的流式与非流式转换都生效
+ *                        思考型模型只吐 reasoning、或 Azure 内容过滤拦截时常见) 的兜底方式。
+ *                        一般不用设 —— 默认 auto 已经覆盖了思考型模型的场景:
+ *                        auto (默认) 手里有思考内容就当正文回吐 (思考型模型把整段答案写进
+ *                        reasoning 通道时能直接救回这一轮), 没有可回吐的则补一段可见说明
+ *                        文本 | text 一律补说明文本 | error 报错中止本轮 (Anthropic 发
+ *                        error 事件, Responses 发 response.failed; 仅流式 — 非流式没有
+ *                        SSE 通道, 与 text 同行为) | pass 原样透传 (客户端会表现为
+ *                        "Done 但没有输出")。两条协议 (anthropic/responses) 的流式与
+ *                        非流式转换都生效
+ *   EMPTY_RESPONSE_RETRIES 可选, 上游返回「完全空」响应 (零内容、零思考就
+ *                        finish_reason=stop, 或零字节断流 —— deepseek-v4-pro 长上下文
+ *                        偶发) 且还没向客户端写出任何帧时的透明重试次数, 默认 1
+ *                        (最多重试一次, 共两次尝试), 设 0 关闭 (上限 3)。
+ *                        仅流式转换生效: message_start / response.created 延迟到第一个
+ *                        真实 delta 才发, 空响应在客户端眼里是零字节, 重试对客户端完全
+ *                        透明; content_filter 拦截不重试 (重试无意义)
  *
  * 出站代理 (Node 核心 http/https 不会自动读代理环境变量, 需手动处理):
  *   GATEWAY_PROXY 可选, 强制指定代理, 例: http://proxy.host:912 (忽略 NO_PROXY)
@@ -66,11 +77,17 @@ const CONVERT_RESPONSES = process.env.CONVERT_RESPONSES !== '0';
 const ATTACH_REASONING = process.env.ATTACH_REASONING === '1';
 const UPSTREAM_CHAT_PATH = process.env.UPSTREAM_CHAT_PATH || '';
 // 上游返回空响应 (finish_reason=stop 但没有任何可见 content) 时的兜底:
-//   text 补一段可见说明文本 | error 用 Anthropic error 事件中止本轮 | pass 原样透传
-const EMPTY_RESPONSE_MODE = process.env.EMPTY_RESPONSE_MODE || 'text';
-// messages[] 里出现 role:"system" (Anthropic 规范不允许, Claude Code 用后台任务通知这么发)
-// 时按 user 发送: 上游遇到「末条 system + 声明无用户输入」会空响应。
-// 只改这一条消息的 role, 前缀缓存不受影响; NORMALIZE_INLINE_SYSTEM=0 可关闭。
+//   auto 有思考内容就当正文回吐, 否则补说明文本 (默认, 无需配置) |
+//   text 一律补说明文本 | error 用 Anthropic error 事件中止本轮 | pass 原样透传
+const EMPTY_RESPONSE_MODE = process.env.EMPTY_RESPONSE_MODE || 'auto';
+// 「完全空」响应 (零内容零思考就 stop/断流) 且客户端还没收到任何帧时的透明重试次数:
+// 默认 1 (共两次尝试), 设 0 关闭, 上限 3 —— 只对"零字节已写出"的流式转换生效
+const EMPTY_RESPONSE_RETRIES = Math.min(3,
+  Math.max(0, parseInt(process.env.EMPTY_RESPONSE_RETRIES || '1', 10)));
+// messages[] 里出现 role:"system" (Anthropic 规范不允许; Claude Code 会这么发后台任务
+// 通知, 也会这么注入环境/CLAUDE.md 上下文) 时一律按 user 发送: 末条 system 会让上游
+// chat 模板空响应; 中间位置 system 会被部分上游 (Qwen 兼容接口) 以
+// 400 "System message must be at the beginning." 硬拒。NORMALIZE_INLINE_SYSTEM=0 可关闭。
 const NORMALIZE_INLINE_SYSTEM = process.env.NORMALIZE_INLINE_SYSTEM !== '0';
 
 // 空响应时把出站消息末段打出来, 便于定位到底是哪条 prompt 触发的
@@ -517,7 +534,7 @@ function handleRequest(req, res, body, id) {
   }
 
   let inlineSystemCount = 0;
-  let trailingSystemNormalized = false;
+  let inlineSystemNormalized = false;
   if (convertKind) {
     let parsed;
     try {
@@ -532,12 +549,10 @@ function handleRequest(req, res, body, id) {
       let converted;
       if (convertKind === 'anthropic') {
         inlineSystemCount = countInlineSystemMessages(parsed);
-        const lastMsg = Array.isArray(parsed.messages) ? parsed.messages[parsed.messages.length - 1] : null;
-        if (lastMsg && lastMsg.role === 'system') {
-          trailingSystemNormalized = NORMALIZE_INLINE_SYSTEM;
-          console.log(`[#${id}] 末条消息 role=system (messages[] 内共 ${inlineSystemCount} 条 system,`
-            + ' 中间位置的保持 system) → '
-            + (NORMALIZE_INLINE_SYSTEM ? '已按 user 发送 (NORMALIZE_INLINE_SYSTEM=0 可关闭)' : '按原样发送'));
+        if (inlineSystemCount > 0) {
+          inlineSystemNormalized = NORMALIZE_INLINE_SYSTEM;
+          console.log(`[#${id}] messages[] 内含 ${inlineSystemCount} 条 role=system → `
+            + (NORMALIZE_INLINE_SYSTEM ? '全部按 user 发送 (NORMALIZE_INLINE_SYSTEM=0 可关闭)' : '按原样发送'));
         }
         converted = convert.anthropicToOpenAI(parsed, { normalizeInlineSystem: NORMALIZE_INLINE_SYSTEM });
       } else {
@@ -589,7 +604,7 @@ function handleRequest(req, res, body, id) {
     request_body: outBody.toString('utf8'),
   };
   if (inlineSystemCount > 0) record.inline_system_messages = inlineSystemCount;
-  if (trailingSystemNormalized) record.trailing_system_normalized = true;
+  if (inlineSystemNormalized) record.inline_system_normalized = true;
   if (convertKind) record.request_body_original = body.toString('utf8');
   if (convertKind) record.protocol_convert = `${convertKind} -> chat/completions`;
 
@@ -600,6 +615,9 @@ function handleRequest(req, res, body, id) {
     recordWritten = true;
     writeRecord(record);
   };
+
+  // 当前活跃的上游请求对象 (零字节空响应透明重试时会换新 request, 客户端断开时销毁它)
+  let activeUpReq = null;
 
   requestUpstream(target, { method: req.method, headers: outHeaders }, proxyUrl, id, (err, upReq, via) => {
     if (err) {
@@ -620,6 +638,7 @@ function handleRequest(req, res, body, id) {
       return;
     }
     record.proxy = via;
+    activeUpReq = upReq;
 
     // 已收到的响应分片/帧, 供客户端断开时补写记录
     const upstreamChunks = [];  // convert 分支: 上游原始 SSE 分片
@@ -671,7 +690,7 @@ function handleRequest(req, res, body, id) {
       // 客户端中途断开 -> 终止上游请求
       res.on('close', () => {
         if (!res.writableEnded) {
-          upReq.destroy();
+          if (activeUpReq) activeUpReq.destroy();
           if (!streamCompleted) {
             console.log(`[#${id}] client disconnected, upstream request aborted`);
             record.aborted = true;
@@ -687,71 +706,154 @@ function handleRequest(req, res, body, id) {
       if (convertKind) {
         // ---- 转换模式: 上游 chat 响应按客户端协议重新组装 ----
         if (isSSE) {
-          const streamConv = convertKind === 'anthropic'
-            ? new convert.AnthropicStreamConverter({ emptyResponseMode: EMPTY_RESPONSE_MODE })
-            : new convert.ResponsesStreamConverter(toolContext, {
-                attachReasoning: ATTACH_REASONING,
-                emptyResponseMode: EMPTY_RESPONSE_MODE
-              });
           const outHeaders2 = { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' };
           for (const [k, v] of Object.entries(respHeaders)) {
             if (!['content-type', 'content-length', 'transfer-encoding'].includes(k)) outHeaders2[k] = v;
           }
           res.writeHead(upRes.statusCode, outHeaders2);
 
-          const writeFrames = (frames) => {
-            for (const frame of frames) {
-              convertedChunks.push(frame);
-              for (const fline of frame.split('\n')) {
-                if (fline) logSSELine(id, fline);
+          // 透明重试: 上游「完全空」响应 (零 delta 就 finish_reason=stop, 或零字节断流)
+          // 且客户端还没收到任何帧时, 丢弃本次转换结果重发上游请求。message_start /
+          // response.created 延迟到第一个真实 delta 才发 (见 convert.js), 所以空响应在
+          // 客户端眼里是零字节, 重试完全透明; 重试次数用尽后走原有兜底策略。
+          let attempt = 0;
+
+          // 空响应 -> 重发同一个上游请求 (首次尝试复用外层已发起的请求, 这里只负责重试)
+          const startRetry = () => {
+            requestUpstream(target, { method: req.method, headers: outHeaders }, proxyUrl, id, (err, upReq3, via) => {
+              if (err) {
+                console.log(banner(`RESP #${id}`, `<- UPSTREAM ERROR after ${Date.now() - startedAt} ms`));
+                console.error(`[#${id}] ${err.message}`);
+                if (err && err.code && TLS_CERT_CODES.has(err.code)) {
+                  console.error(`[#${id}] hint: TLS 证书校验失败 — 若是公司 MITM 代理, 设置 NODE_EXTRA_CA_CERTS=<ca.pem>; 仅调试可用 NODE_TLS_REJECT_UNAUTHORIZED=0`);
+                }
+                record.proxy = 'error';
+                record.error = err.message;
+                saveRecord();
+                res.end(); // SSE 头已发出, 只能中断流 (客户端会看到不完整响应)
+                return;
               }
-              if (isTerminalFrame(frame)) streamCompleted = true;
-              if (res.writableEnded) return;
-              if (!res.write(frame)) {
-                upRes.pause();
-                res.once('drain', () => upRes.resume());
+              record.proxy = via;
+              activeUpReq = upReq3;
+              let retryResponseStarted = false;
+              upReq3.setTimeout(FIRST_BYTE_TIMEOUT_MS, () => {
+                if (!retryResponseStarted) {
+                  upReq3.destroy(new Error(`upstream 在 ${FIRST_BYTE_TIMEOUT_MS}ms 内没有响应 (请求可能未发出或被静默丢弃)`));
+                }
+              });
+              upReq3.on('finish', () => {
+                idLog(id, `outbound request 已写出 (重试, ${body.length} bytes, +${Date.now() - startedAt}ms) — 等待上游响应`);
+              });
+              if (res.destroyed || res.writableEnded) {
+                upReq3.destroy();
+                console.log(`[#${id}] client disconnected before upstream retry was sent`);
+                return;
               }
-            }
+              upReq3.on('response', (upRes3) => {
+                retryResponseStarted = true;
+                upReq3.setTimeout(0);
+                const durMs = Date.now() - startedAt;
+                const respHeaders3 = {};
+                for (const [k, v] of Object.entries(upRes3.headers)) {
+                  if (!HOP_BY_HOP.has(k)) respHeaders3[k] = v;
+                }
+                console.log(banner(`RESP #${id}`, `<- ${upRes3.statusCode} ${upRes3.statusMessage || ''} in ${durMs} ms`));
+                console.log(`[#${id}] response headers : ${JSON.stringify(displayHeaders(respHeaders3), null, 2)}`);
+                record.response_status = upRes3.statusCode;
+                record.response_headers = respHeaders3;
+                record.duration_ms = durMs;
+                handleSSEResponse(upReq3, upRes3);
+              });
+
+              if (outBody.length) upReq3.write(outBody);
+              upReq3.end();
+            });
           };
-          let lineBuf = '';
-          const feedLine = (line) => {
-            // 转换器只消费 data 行, event:/注释行忽略
-            if (!line.startsWith('data:')) return;
-            const data = line.slice(5).trimStart();
-            writeFrames(streamConv.push(data));
-          };
-          upRes.on('data', (chunk) => {
-            upstreamChunks.push(chunk);
-            lineBuf += chunk.toString('utf8');
-            let idx;
-            while ((idx = lineBuf.indexOf('\n')) !== -1) {
-              const line = lineBuf.slice(0, idx).replace(/\r$/, '');
-              lineBuf = lineBuf.slice(idx + 1);
-              feedLine(line);
-            }
-          });
-          upRes.on('end', () => {
-            if (lineBuf) feedLine(lineBuf);
-            writeFrames(streamConv.flush());
-            // 记录上游原始 finish_reason: 只有它才能区分 "模型自己 stop" 与
-            // "content_filter 拦截" (后者在 Anthropic 侧同样表现为空响应)
-            if (streamConv.upstreamFinishReason) {
-              console.log(`[#${id}] upstream finish_reason: ${streamConv.upstreamFinishReason}`);
-              record.upstream_finish_reason = streamConv.upstreamFinishReason;
-            }
-            if (streamConv.emptyResponseDetected) {
-              console.log(`[#${id}] [WARN] 上游空响应: finish_reason=${streamConv.upstreamFinishReason || '?'},`
-                + ` 没有任何可见输出 (兜底策略=${EMPTY_RESPONSE_MODE})`);
-              for (const l of outboundTailLines(outBody)) {
-                console.log(`[#${id}]        出站末段 ${l}`);
+
+          // 把一次上游 SSE 响应转换后写给客户端; 结束时判定是否需要透明重试
+          const handleSSEResponse = (upReqX, upResX) => {
+            const streamConv = convertKind === 'anthropic'
+              ? new convert.AnthropicStreamConverter({ emptyResponseMode: EMPTY_RESPONSE_MODE })
+              : new convert.ResponsesStreamConverter(toolContext, {
+                  attachReasoning: ATTACH_REASONING,
+                  emptyResponseMode: EMPTY_RESPONSE_MODE
+                });
+            const writeFrames = (frames) => {
+              for (const frame of frames) {
+                convertedChunks.push(frame);
+                for (const fline of frame.split('\n')) {
+                  if (fline) logSSELine(id, fline);
+                }
+                if (isTerminalFrame(frame)) streamCompleted = true;
+                if (res.writableEnded) return;
+                if (!res.write(frame)) {
+                  upResX.pause();
+                  res.once('drain', () => upResX.resume());
+                }
               }
-              record.empty_response = true;
-            }
-            record.response_body_upstream = Buffer.concat(upstreamChunks).toString('utf8');
-            record.response_body = convertedChunks.join('');
-            saveRecord();
-            res.end();
-          });
+            };
+            let lineBuf = '';
+            const feedLine = (line) => {
+              // 转换器只消费 data 行, event:/注释行忽略
+              if (!line.startsWith('data:')) return;
+              const data = line.slice(5).trimStart();
+              writeFrames(streamConv.push(data));
+            };
+            upResX.on('data', (chunk) => {
+              upstreamChunks.push(chunk);
+              lineBuf += chunk.toString('utf8');
+              let idx;
+              while ((idx = lineBuf.indexOf('\n')) !== -1) {
+                const line = lineBuf.slice(0, idx).replace(/\r$/, '');
+                lineBuf = lineBuf.slice(idx + 1);
+                feedLine(line);
+              }
+            });
+            upResX.on('end', () => {
+              if (lineBuf) feedLine(lineBuf);
+              const flushFrames = streamConv.flush();
+              // 透明重试判据: 客户端零字节已写出 + 上游一个真实 delta 都没吐 +
+              // 以 stop 收尾或直接断流。content_filter / tool_calls / 已出思考等不重试。
+              const finish = streamConv.upstreamFinishReason;
+              if (convertedChunks.length === 0
+                  && !streamConv.sawRealDelta
+                  && (finish === 'stop' || finish === null)
+                  && attempt < EMPTY_RESPONSE_RETRIES
+                  && !res.writableEnded && !res.destroyed) {
+                attempt += 1;
+                record.upstream_retries = attempt;
+                console.log(`[#${id}] [WARN] 上游空响应 (finish_reason=${finish || '断流'},`
+                  + ` 客户端零字节已写出) — 透明重试 ${attempt}/${EMPTY_RESPONSE_RETRIES}`);
+                return startRetry();
+              }
+              writeFrames(flushFrames);
+              // 记录上游原始 finish_reason: 只有它才能区分 "模型自己 stop" 与
+              // "content_filter 拦截" (后者在 Anthropic 侧同样表现为空响应)
+              if (streamConv.upstreamFinishReason) {
+                console.log(`[#${id}] upstream finish_reason: ${streamConv.upstreamFinishReason}`);
+                record.upstream_finish_reason = streamConv.upstreamFinishReason;
+              }
+              if (streamConv.emptyResponseDetected) {
+                console.log(`[#${id}] [WARN] 上游空响应: finish_reason=${streamConv.upstreamFinishReason || '?'},`
+                  + ` 没有任何可见输出 (模型=${streamConv.currentModel || '?'},`
+                  + ` 兜底策略=${EMPTY_RESPONSE_MODE}`
+                  + (streamConv.emptyResponseSalvagedReasoning
+                    ? `, 已把 ${streamConv.thinkingText.length} 字符思考内容当正文回吐`
+                    : '')
+                  + (attempt > 0 ? `, 已透明重试 ${attempt} 次` : '')
+                  + ')');
+                for (const l of outboundTailLines(outBody)) {
+                  console.log(`[#${id}]        出站末段 ${l}`);
+                }
+                record.empty_response = true;
+              }
+              record.response_body_upstream = Buffer.concat(upstreamChunks).toString('utf8');
+              record.response_body = convertedChunks.join('');
+              saveRecord();
+              res.end();
+            });
+          };
+          handleSSEResponse(upReq, upRes);
         } else {
           // 非流式 (含上游 JSON 错误): 攒完整 body, 转换后一次性回给客户端
           upRes.on('data', (chunk) => bodyParts.push(chunk));
@@ -766,7 +868,7 @@ function handleRequest(req, res, body, id) {
                       ? convert.chatErrorToAnthropicError(parsed)
                       : convert.chatErrorToResponseError(parsed))
                   : (convertKind === 'anthropic'
-                  ? convert.openaiToAnthropic(parsed)
+                  ? convert.openaiToAnthropic(parsed, { emptyResponseMode: EMPTY_RESPONSE_MODE })
                   : convert.chatCompletionToResponse(parsed, toolContext, {
                       emptyResponseMode: EMPTY_RESPONSE_MODE
                     }))
@@ -893,9 +995,18 @@ server.listen(PORT, () => {
     if (ATTACH_REASONING) {
       console.log('ATTACH_REASONING : 开启 — 转换时附挂 reasoning_content (思考型上游)');
     }
-    console.log('末条 system 归一 : ' + (NORMALIZE_INLINE_SYSTEM
-      ? '开启 — messages[] 内 role:"system" 按 user 发送 (NORMALIZE_INLINE_SYSTEM=0 关闭)'
+    console.log('内联 system 归一 : ' + (NORMALIZE_INLINE_SYSTEM
+      ? '开启 — messages[] 内所有 role:"system" 按 user 发送 (NORMALIZE_INLINE_SYSTEM=0 关闭)'
       : '关闭 — 按原样转发'));
+    console.log('空响应兜底      : ' + ({
+      auto: 'auto — 有思考内容就当正文回吐, 否则补说明文本 (默认)',
+      text: 'text — 一律补一段可见说明文本',
+      error: 'error — 用 error 事件中止本轮 (仅流式, 非流式同 text)',
+      pass: 'pass — 原样透传 (客户端会显示 Done 但没有任何输出)'
+    }[EMPTY_RESPONSE_MODE] || EMPTY_RESPONSE_MODE));
+    console.log('空响应透明重试  : ' + (EMPTY_RESPONSE_RETRIES > 0
+      ? `开启 — 零字节空响应自动重发上游请求, 最多重试 ${EMPTY_RESPONSE_RETRIES} 次 (仅流式)`
+      : '关闭 (EMPTY_RESPONSE_RETRIES=0)'));
   }
   try {
     const upUrl = new URL(UPSTREAM_URL);

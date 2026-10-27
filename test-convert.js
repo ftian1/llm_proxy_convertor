@@ -54,26 +54,22 @@ test('anthropic messages[] 内的 system 归一为 user (Claude Code 后台任�
     ],
   };
   const chat = c.anthropicToOpenAI(body);
-  // 顶层 system 与「中间位置」的 system 都原样保留; 只有末条归一为 user
+  // 顶层 system 保留在首位; messages[] 内的 system (含中间位置) 全部归一为 user ——
+  // 部分上游 (Qwen 兼容接口) 对非首位 system 直接 400 "System message must be at the beginning."
   assert.deepStrictEqual(chat.messages.map((m) => m.role),
-    ['system', 'user', 'system', 'assistant', 'user', 'user']);
+    ['system', 'user', 'user', 'assistant', 'user', 'user']);
   // 内容逐字保留, 只动 role 字段
   assert.strictEqual(chat.messages[2].content, 'CLAUDE.md / env 上下文 (中间位置)');
   assert.strictEqual(chat.messages[5].content, notif[0].text);
 
-  // 前缀 (末条之前) 与关闭开关时完全一致 -> 不影响前缀缓存
+  // 关闭开关时全部原样保留; 与开启时相比只有 role 不同, 内容逐字节一致
   const off = c.anthropicToOpenAI(body, { normalizeInlineSystem: false });
   assert.deepStrictEqual(off.messages.map((m) => m.role),
     ['system', 'user', 'system', 'assistant', 'user', 'system']);
-  assert.deepStrictEqual(chat.messages.slice(0, 5), off.messages.slice(0, 5));
-  assert.strictEqual(chat.messages[5].content, off.messages[5].content);
-
-  // 末条不是 system 时不动任何东西
-  const userTail = c.anthropicToOpenAI({
-    model: 'm',
-    messages: [{ role: 'user', content: 'hi' }, { role: 'system', content: 'mid' }, { role: 'user', content: 'tail' }],
-  });
-  assert.deepStrictEqual(userTail.messages.map((m) => m.role), ['user', 'system', 'user']);
+  assert.strictEqual(off.messages.length, chat.messages.length);
+  for (let i = 0; i < off.messages.length; i += 1) {
+    assert.strictEqual(chat.messages[i].content, off.messages[i].content);
+  }
 });
 
 test('anthropic tool_use/tool_result/thinking 历史转换', () => {
@@ -397,6 +393,18 @@ const emptyStream = () => [
 ];
 const eventTypes = (out) => [...out.matchAll(/event: (\w+)/g)].map((m) => m[1]);
 const drive = (conv, feed) => feed.map((d) => conv.push(d).join('')).join('') + conv.flush().join('');
+const frames = (out) => out.split('\n\n').filter(Boolean).map((blk) => ({
+  event: blk.match(/^event: (.*)$/m)[1],
+  data: JSON.parse(blk.match(/^data: (.*)$/m)[1])
+}));
+// Anthropic 侧正文 (content_block_delta 里 type=text_delta 的 text 拼接)
+const anthropicText = (out) => frames(out)
+  .filter((f) => f.event === 'content_block_delta' && f.data.delta.type === 'text_delta')
+  .map((f) => f.data.delta.text).join('');
+// Responses 侧正文 (response.output_text.delta 的 delta 拼接)
+const responsesText = (out) => frames(out)
+  .filter((f) => f.event === 'response.output_text.delta')
+  .map((f) => f.data.delta).join('');
 
 test('AnthropicStreamConverter: 空响应默认补可见文本 (不再是静默 Done)', () => {
   const a = new c.AnthropicStreamConverter();
@@ -411,7 +419,8 @@ test('AnthropicStreamConverter: 空响应默认补可见文本 (不再是静默 
 test('AnthropicStreamConverter: EMPTY_RESPONSE_MODE=error 中止本轮 / pass 原样透传', () => {
   const errConv = new c.AnthropicStreamConverter({ emptyResponseMode: 'error' });
   const errOut = drive(errConv, emptyStream());
-  assert.deepStrictEqual(eventTypes(errOut), ['message_start', 'error']);
+  // 零 delta 流: message_start 被延迟且永远不会发, 只有 error 事件 (客户端直接看到请求失败)
+  assert.deepStrictEqual(eventTypes(errOut), ['error']);
   assert.ok(!errOut.includes('message_stop')); // 已用 error 事件收尾
 
   const passConv = new c.AnthropicStreamConverter({ emptyResponseMode: 'pass' });
@@ -431,7 +440,7 @@ test('AnthropicStreamConverter: 有可见输出时不触发空响应兜底', () 
 });
 
 test('AnthropicStreamConverter: 仅 thinking 也算空响应, 且 thinking 块补 signature_delta', () => {
-  const a = new c.AnthropicStreamConverter();
+  const a = new c.AnthropicStreamConverter(); // 不传 mode = 默认 auto
   const out = drive(a, [
     JSON.stringify({ choices: [{ delta: { reasoning_content: '想一下' } }] }),
     JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
@@ -439,8 +448,11 @@ test('AnthropicStreamConverter: 仅 thinking 也算空响应, 且 thinking 块�
   ]);
   assert.ok(out.includes('thinking_delta'));
   assert.ok(out.includes('signature_delta'));
-  assert.ok(out.includes('上游返回了空响应'));
+  // 默认 auto: 手里有思考内容 -> 当正文回吐, 而不是补说明文本
+  assert.strictEqual(anthropicText(out), '想一下');
+  assert.ok(!out.includes('上游返回了空响应'));
   assert.strictEqual(a.emptyResponseDetected, true);
+  assert.strictEqual(a.emptyResponseSalvagedReasoning, true);
 });
 
 test('AnthropicStreamConverter: content_filter 映射为 refusal 并记录原始 finish_reason', () => {
@@ -452,6 +464,45 @@ test('AnthropicStreamConverter: content_filter 映射为 refusal 并记录原始
   const delta = JSON.parse(out.match(/event: message_delta\ndata: (.*)/)[1]);
   assert.strictEqual(delta.delta.stop_reason, 'refusal');
   assert.strictEqual(a.upstreamFinishReason, 'content_filter');
+});
+
+// ---------------------------------------------------------------------------
+// message_start 延迟 (透明重试的前提): 只有带 role / 空 delta / finish_reason 的
+// chunk 不触发, 第一个真实 delta (推理/正文/工具调用) 才发 message_start。
+// 这样上游「零内容空 completion」在客户端眼里是零字节, 网关可以整体丢弃重试。
+// ---------------------------------------------------------------------------
+
+test('AnthropicStreamConverter: 零 delta 流 push 不发任何帧, 收尾时补发 message_start', () => {
+  const a = new c.AnthropicStreamConverter();
+  const [c1, c2, done] = emptyStream();
+  assert.strictEqual(a.push(c1).join(''), ''); // 空 delta: 不触发 message_start
+  assert.strictEqual(a.push(c2).join(''), ''); // 只有 finish_reason: 同样不发
+  assert.strictEqual(a.sawRealDelta, false);
+  const out = a.push(done).join('') + a.flush().join('');
+  // [DONE] 收尾时补发 message_start, 保证 message_delta/message_stop 前有序
+  assert.deepStrictEqual(eventTypes(out), ['message_start', 'content_block_start',
+    'content_block_delta', 'content_block_stop', 'message_delta', 'message_stop']);
+});
+
+test('AnthropicStreamConverter: 第一个真实 delta 才发 message_start, sawRealDelta 置位', () => {
+  const a = new c.AnthropicStreamConverter();
+  assert.strictEqual(a.push(JSON.stringify({ choices: [{ delta: { role: 'assistant' } }] })).join(''), '');
+  assert.strictEqual(a.push(JSON.stringify({ choices: [{ delta: {} }] })).join(''), '');
+  assert.strictEqual(a.sawRealDelta, false);
+  const out = a.push(JSON.stringify({ choices: [{ delta: { content: 'hi' } }] })).join('');
+  assert.deepStrictEqual(eventTypes(out), ['message_start', 'content_block_start', 'content_block_delta']);
+  assert.strictEqual(a.sawRealDelta, true);
+});
+
+test('ResponsesStreamConverter: 零 delta 流 push 不发 response.created, 收尾时补发', () => {
+  const r = new c.ResponsesStreamConverter(new c.ToolContext());
+  const c1 = JSON.stringify({ id: 'chatcmpl_e', model: 'm', choices: [{ delta: {} }] });
+  const c2 = JSON.stringify({ id: 'chatcmpl_e', choices: [{ delta: {}, finish_reason: 'stop' }] });
+  assert.strictEqual(r.push(c1).join(''), ''); // 空 delta: 不触发 response.created
+  assert.strictEqual(r.push(c2).join(''), ''); // 只有 finish_reason: 同样不发
+  assert.strictEqual(r.sawRealDelta, false);
+  const out = r.push('[DONE]').join('') + r.flush().join('');
+  assert.ok(out.startsWith('event: response.created')); // finalize 兜底补发
 });
 
 // ---------------------------------------------------------------------------
@@ -492,14 +543,16 @@ test('ResponsesStreamConverter: EMPTY_RESPONSE_MODE=error/pass', () => {
 });
 
 test('ResponsesStreamConverter: 仅 reasoning / 正常文本 / length 的行为', () => {
-  // 只有 reasoning -> 算空响应, 仍补文本
+  // 只有 reasoning -> 算空响应, 默认 auto 回吐思考内容
   const onlyReasoning = new c.ResponsesStreamConverter(new c.ToolContext());
   const ro = drive(onlyReasoning, [
     JSON.stringify({ choices: [{ delta: { reasoning_content: '想一下' } }] }),
     JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
     '[DONE]',
   ]);
-  assert.ok(ro.includes('上游返回了空响应'));
+  assert.strictEqual(responsesText(ro), '想一下');
+  assert.ok(!ro.includes('上游返回了空响应'));
+  assert.strictEqual(onlyReasoning.emptyResponseSalvagedReasoning, true);
 
   // 有正文 -> 不兜底
   const withText = new c.ResponsesStreamConverter(new c.ToolContext());
@@ -559,6 +612,160 @@ test('chatCompletionToResponse: 空响应补文本 / content_filter -> incomplet
   }, undefined, { emptyResponseMode: 'pass' });
   assert.deepStrictEqual(pass.output, []);
   assert.strictEqual(pass.status, 'completed');
+});
+
+// ---------------------------------------------------------------------------
+// 空响应兜底默认策略 auto: 思考型模型把整段答案写进 reasoning 通道就停
+// (DeepSeek-V4-Pro 长上下文下的退化), 手里有思考内容就当正文回吐, 救回这一轮。
+// 不按模型名判断 —— 依据是这条响应本身 (整条流没有可见输出 + 有思考内容)。
+// ---------------------------------------------------------------------------
+
+const reasoningOnlyStream = [
+  JSON.stringify({ id: 'chatcmpl_r', model: 'm',
+    choices: [{ delta: { reasoning_content: '好的, 这是答案正文。' } }] }),
+  JSON.stringify({ id: 'chatcmpl_r', choices: [{ delta: {}, finish_reason: 'stop' }] }),
+  '[DONE]',
+];
+
+test('AnthropicStreamConverter: 默认 auto 把思考内容当正文回吐 (无需任何配置)', () => {
+  const a = new c.AnthropicStreamConverter();
+  const out = drive(a, reasoningOnlyStream);
+  assert.strictEqual(a.emptyResponseDetected, true);
+  assert.strictEqual(a.emptyResponseSalvagedReasoning, true);
+  assert.strictEqual(a.thinkingText, '好的, 这是答案正文。');
+  // 回吐的是模型自己的正文, 不再是 gateway 的说明文本
+  assert.ok(!out.includes('上游返回了空响应'));
+  assert.strictEqual(anthropicText(out), '好的, 这是答案正文。');
+  // 思考块本体照旧发出 (补 signature_delta), 正文另起一个 text 块
+  const deltas = frames(out).filter((f) => f.event === 'content_block_delta');
+  assert.strictEqual(deltas.filter((d) => d.data.delta.type === 'thinking_delta').length, 1);
+  // 仍是合法的 Anthropic 事件序列
+  assert.deepStrictEqual(eventTypes(out), ['message_start', 'content_block_start',
+    'content_block_delta', 'content_block_delta', 'content_block_stop', 'content_block_start',
+    'content_block_delta', 'content_block_stop', 'message_delta', 'message_stop']);
+});
+
+test('AnthropicStreamConverter: 没有思考可回吐时退回说明文本', () => {
+  const a = new c.AnthropicStreamConverter(); // 默认 auto
+  const out = drive(a, emptyStream());
+  assert.ok(out.includes('上游返回了空响应'));
+  assert.strictEqual(a.emptyResponseDetected, true);
+  assert.strictEqual(a.emptyResponseSalvagedReasoning, false);
+});
+
+test('AnthropicStreamConverter: EMPTY_RESPONSE_MODE=text 仍可强制只补说明文本', () => {
+  const a = new c.AnthropicStreamConverter({ emptyResponseMode: 'text' });
+  const out = drive(a, reasoningOnlyStream);
+  assert.ok(out.includes('上游返回了空响应'));
+  assert.strictEqual(a.emptyResponseDetected, true);
+  assert.strictEqual(a.emptyResponseSalvagedReasoning, false);
+});
+
+test('ResponsesStreamConverter: 默认 auto 把思考内容当正文回吐', () => {
+  const r = new c.ResponsesStreamConverter(new c.ToolContext());
+  const out = drive(r, reasoningOnlyStream);
+  assert.strictEqual(r.emptyResponseSalvagedReasoning, true);
+  assert.ok(!out.includes('上游返回了空响应'));
+  assert.strictEqual(responsesText(out), '好的, 这是答案正文。');
+  assert.ok(out.includes('event: response.completed'));
+});
+
+test('openaiToAnthropic: 非流式空响应兜底 (默认 auto / text / pass)', () => {
+  const body = (content, reasoning) => ({
+    id: 'chatcmpl_r', model: 'm',
+    choices: [{ finish_reason: 'stop', message: { content, reasoning_content: reasoning } }],
+    usage: { prompt_tokens: 10, completion_tokens: 7, total_tokens: 17 }
+  });
+
+  // 默认 auto: 有思考内容 -> 当正文回吐
+  const salvaged = c.openaiToAnthropic(body('', '好的, 这是答案正文。'));
+  assert.strictEqual(salvaged.content.length, 2);
+  assert.deepStrictEqual(salvaged.content[1], { type: 'text', text: '好的, 这是答案正文。' });
+
+  // text: 强制只补说明文本 (thinking 块保留)
+  const note = c.openaiToAnthropic(body('', '想一下'), { emptyResponseMode: 'text' });
+  assert.strictEqual(note.content.length, 2);
+  assert.strictEqual(note.content[0].type, 'thinking');
+  assert.ok(note.content[1].text.includes('上游返回了空响应'));
+
+  // 完全没有 reasoning 可回吐 -> 退回说明文本
+  const bare = c.openaiToAnthropic(body('', undefined));
+  assert.strictEqual(bare.content.length, 1);
+  assert.ok(bare.content[0].text.includes('上游返回了空响应'));
+
+  // pass: 原样返回 (只有 thinking 块)
+  const pass = c.openaiToAnthropic(body('', '想一下'), { emptyResponseMode: 'pass' });
+  assert.strictEqual(pass.content.length, 1);
+
+  // 有正文时不兜底
+  assert.deepStrictEqual(
+    c.openaiToAnthropic(body('hi', '想一下')).content,
+    [{ type: 'thinking', thinking: '想一下' }, { type: 'text', text: 'hi' }]
+  );
+});
+
+test('chatCompletionToResponse: 默认 auto 把思考内容当正文回吐', () => {
+  const r = c.chatCompletionToResponse({
+    id: 'chatcmpl_r', model: 'm', created: 1,
+    choices: [{ finish_reason: 'stop',
+      message: { content: '', reasoning_content: '好的, 这是答案正文。' } }]
+  });
+  assert.strictEqual(r.status, 'completed');
+  const msg = r.output.find((i) => i.type === 'message');
+  assert.strictEqual(msg.content[0].text, '好的, 这是答案正文。');
+  assert.ok(!JSON.stringify(r).includes('上游返回了空响应'));
+});
+
+// ---------------------------------------------------------------------------
+// 上游断流兜底: 上游在发出 finish_reason 之前就结束流 (没有 finish_reason、也没有
+// [DONE] —— 长上下文下模型返回完全空的 completion 时 LiteLLM 会这样直接关流)。
+// 原来这里什么都不发, 客户端只收到"只有 message_start 就断掉"的流: 不报错、也没有
+// 完成事件, Claude Code 表现为 query 静默停住。与 Responses 侧 stream_truncated 对齐。
+// ---------------------------------------------------------------------------
+
+test('AnthropicStreamConverter: 上游断流且无可见输出 -> 发 error 事件 (不再静默断流)', () => {
+  const a = new c.AnthropicStreamConverter();
+  const out = drive(a, [
+    JSON.stringify({ id: 'chatcmpl_t', model: 'm',
+      choices: [{ delta: { role: 'assistant' } }] })
+  ]); // 既没有 finish_reason 也没有 [DONE]
+  // 零 delta 流: message_start 被延迟且永远不会发, 只有 error 事件
+  assert.deepStrictEqual(eventTypes(out), ['error']);
+  assert.ok(out.includes('stream_truncated'));
+  assert.ok(!out.includes('message_stop'));
+  assert.strictEqual(a.sawRealDelta, false); // 网关据此判定可透明重试
+});
+
+test('AnthropicStreamConverter: 上游断流但已出正文 -> 按 max_tokens 收尾 (客户端可续写)', () => {
+  const a = new c.AnthropicStreamConverter();
+  const out = drive(a, [
+    JSON.stringify({ choices: [{ delta: { content: '写了一半' } }] })
+  ]);
+  assert.deepStrictEqual(eventTypes(out), ['message_start', 'content_block_start',
+    'content_block_delta', 'content_block_stop', 'message_delta', 'message_stop']);
+  assert.strictEqual(anthropicText(out), '写了一半'); // 断流前的输出保住了
+  const md = frames(out).find((f) => f.event === 'message_delta');
+  assert.strictEqual(md.data.delta.stop_reason, 'max_tokens');
+});
+
+test('AnthropicStreamConverter: 上游断流在工具调用中途 -> 闭合已开的 tool_use 块', () => {
+  const a = new c.AnthropicStreamConverter();
+  const out = drive(a, [
+    JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_1',
+      type: 'function', function: { name: 'bash', arguments: '{"cmd":' } }] } }] })
+  ]);
+  // 已 start 的 tool_use 块必须补 content_block_stop, 不能留残缺事件序列
+  assert.deepStrictEqual(eventTypes(out), ['message_start', 'content_block_start',
+    'content_block_delta', 'content_block_stop', 'message_delta', 'message_stop']);
+  const md = frames(out).find((f) => f.event === 'message_delta');
+  assert.strictEqual(md.data.delta.stop_reason, 'max_tokens');
+});
+
+test('AnthropicStreamConverter: 正常 [DONE] 收尾不受断流兜底影响', () => {
+  const a = new c.AnthropicStreamConverter();
+  const out = drive(a, emptyStream()); // 含 [DONE]
+  assert.deepStrictEqual(eventTypes(out), ['message_start', 'content_block_start',
+    'content_block_delta', 'content_block_stop', 'message_delta', 'message_stop']);
 });
 
 console.log(`\nALL ${passed} TESTS PASSED`);

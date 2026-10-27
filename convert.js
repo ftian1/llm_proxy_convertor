@@ -314,17 +314,17 @@ function toolOutputContent(content) {
 }
 
 // 单条 Anthropic 消息 -> 多条 chat 消息 (tool_result 拆成独立 tool 消息)
-// Claude Code CLI 会把「后台任务通知」以 role:"system" 追加在 messages 末尾。上游 chat
-// 模板遇到「末条 system + 文案声明无用户输入」时会直接空响应 (finish_reason=stop, 只有
-// 1 个 reasoning token, 无任何可见 content), Claude Code TUI 于是显示 Done 却没有输出。
-// 同一份请求体只把末条 role 改成 user 即可正常生成 (README troubleshooting 有 A/B 记录)。
-//
-// 只归一「末条」这一条: 中间位置的 system 消息 (Claude Code 注入的环境 / CLAUDE.md /
-// skills 上下文) 一直是 system, 上游能正常接续生成, 保留其 system 权重更安全, 也不会
-// 因为改 role 而使该位置之后的 prompt 前缀缓存全部失效。NORMALIZE_INLINE_SYSTEM=0 关闭。
-function normalizeInlineSystemRole(msg, opts, isLast) {
+// Claude Code 会把 role:"system" 混进 messages[] (Anthropic 规范不允许):
+// 末尾的后台任务通知, 以及中间位置的环境 / CLAUDE.md / skills 上下文。两类都会出事:
+// - 末条 system + 「声明无用户输入」文案 -> 上游 chat 模板直接空响应 (finish_reason=stop,
+//   只有 1 个 reasoning token), Claude Code TUI 显示 Done 却没有输出 (README 有 A/B 记录)
+// - 中间位置 system -> 部分上游 (Qwen 兼容接口) 硬拒: 400 "System message must be
+//   at the beginning."
+// 所以 messages[] 内的 system 一律按 user 发送 (内容逐字不动, 只改 role); 顶层
+// system 参数转换出的 system 消息固定在最前, 不受影响。NORMALIZE_INLINE_SYSTEM=0 关闭。
+function normalizeInlineSystemRole(msg, opts) {
   const role = (msg && msg.role) || 'user';
-  if (isLast && role === 'system' && opts.normalizeInlineSystem !== false) return 'user';
+  if (role === 'system' && opts.normalizeInlineSystem !== false) return 'user';
   return role;
 }
 
@@ -440,11 +440,9 @@ function anthropicToOpenAI(body, opts = {}) {
   }
 
   if (Array.isArray(body.messages)) {
-    const lastIndex = body.messages.length - 1;
-    for (let i = 0; i < body.messages.length; i += 1) {
-      const msg = body.messages[i];
+    for (const msg of body.messages) {
       messages.push(...convertMessageToOpenAI(
-        normalizeInlineSystemRole(msg, opts, i === lastIndex), msg && msg.content, opts));
+        normalizeInlineSystemRole(msg, opts), msg && msg.content, opts));
     }
   }
   result.messages = messages;
@@ -527,11 +525,14 @@ function mapStopReason(finishReason) {
 // 不兜底的话客户端只会静默 "Done 但没有输出", 完全看不出发生了什么。
 // ---------------------------------------------------------------------------
 
-// 兜底策略: text (默认) 补一段可见说明文本 | error 报错中止本轮 | pass 原样透传
-const EMPTY_RESPONSE_MODES = new Set(['text', 'error', 'pass']);
+// 兜底策略:
+//   auto (默认) 有思考内容可回吐就当正文回吐, 否则补说明文本 —— 见下
+//   text 一律补一段可见说明文本 | error 报错中止本轮 (仅流式: 非流式没有 SSE 通道可发
+//   error 事件, 与 text 同行为) | pass 原样透传
+const EMPTY_RESPONSE_MODES = new Set(['auto', 'text', 'error', 'pass']);
 
 function normalizeEmptyResponseMode(mode) {
-  return EMPTY_RESPONSE_MODES.has(mode) ? mode : 'text';
+  return EMPTY_RESPONSE_MODES.has(mode) ? mode : 'auto';
 }
 
 // detail 形如 "stop_reason=end_turn, output_tokens=1"
@@ -541,6 +542,29 @@ function emptyResponseNote(detail, finishReason) {
     : '思考型模型只产出 reasoning 就停止 (或上游直接返回了空 completion)';
   return `[gateway] 上游返回了空响应: 没有任何可见输出 (${detail})。`
     + `原因: ${cause}; 建议重试或更换模型。`;
+}
+
+// 兜底正文 (auto 模式, 默认)。思考型模型把整段答案写进 reasoning 通道就停时
+// (DeepSeek-V4-Pro 长上下文下的已知退化: ~700k tokens 时约 16% 的请求), 把上游已经
+// 产出的思考内容原样当正文回吐, 是唯一能救回这一轮的字节 —— 那是模型自己的正文,
+// 比 gateway 的一段说明文本有用得多。
+//
+// 「是不是思考型模型」不按模型名判断, 而按这条响应本身判断: 走到这里就说明整条流没有
+// 任何可见输出, 此时手里还有思考内容 => 这个模型刚刚把答案写进了思考通道。
+// 实测依据: deepseek-v4-flash-0731 有 49% 的响应在吐 reasoning (是思考模型) 但 592 次
+// 请求 0 次空响应, deepseek-v4-pro 是 76% / 40 次空响应 —— 模型名区分不出这两者,
+// 「这次响应里有没有思考内容」才区分得出; 对将来新出的模型也不需要维护名单。
+// 没有思考可回吐 (纯空 completion / content_filter) 时退回说明文本。
+function emptyResponseFallbackText(mode, detail, finishReason, reasoning) {
+  const salvaged = mode === 'auto' && typeof reasoning === 'string'
+    ? reasoning.trim()
+    : '';
+  return salvaged !== '' ? salvaged : emptyResponseNote(detail, finishReason);
+}
+
+// 该条 reasoning 是否会被当正文回吐 (供日志区分"回吐了思考"与"只补了说明文本")
+function isEmptyResponseSalvaged(mode, reasoning) {
+  return mode === 'auto' && typeof reasoning === 'string' && reasoning.trim() !== '';
 }
 
 // Responses 输出里是否存在"可见"内容项 (reasoning 项不算)
@@ -556,11 +580,19 @@ function responseOutputHasVisibleItem(output) {
   });
 }
 
+// chat message 里的思考内容 (DeepSeek/Kimi 用 reasoning_content, OpenRouter 用 reasoning)
+function messageReasoningText(message) {
+  if (!message) return '';
+  const v = message.reasoning_content !== undefined
+    ? message.reasoning_content : message.reasoning;
+  return typeof v === 'string' ? v : '';
+}
+
 /**
  * Chat Completions 响应 -> Anthropic Messages 响应 (非流式)
  * 对应 cc-switch transform.rs::openai_to_anthropic
  */
-function openaiToAnthropic(body) {
+function openaiToAnthropic(body, opts = {}) {
   const choices = body && body.choices;
   if (!Array.isArray(choices) || choices.length === 0) {
     throw new Error('No choices in response');
@@ -629,6 +661,22 @@ function openaiToAnthropic(body) {
   const stopReason = mapStopReason(choice.finish_reason);
   const usage = buildAnthropicUsageJson(body.usage || {});
 
+  // 空响应兜底: 上游正常收尾但 content[] 里没有任何可见块 (只有 thinking 或全空)。
+  // 与流式路径同语义, 否则非流式请求会静默返回一个没有正文的 message。
+  const emptyMode = normalizeEmptyResponseMode(opts.emptyResponseMode);
+  const hasVisibleBlock = content.some((b) => b.type === 'text' || b.type === 'tool_use');
+  if (!hasVisibleBlock && emptyMode !== 'pass'
+      && (stopReason === 'end_turn' || stopReason === 'refusal')) {
+    const detail = `stop_reason=${stopReason}, finish_reason=${choice.finish_reason || '?'}`
+      + `, output_tokens=${usage.output_tokens || 0}`;
+    content.push({
+      type: 'text',
+      text: emptyResponseFallbackText(
+        emptyMode, detail, choice.finish_reason, messageReasoningText(message)
+      )
+    });
+  }
+
   return {
     id: body.id || '',
     type: 'message',
@@ -686,13 +734,46 @@ class AnthropicStreamConverter {
     this.emptyResponseMode = normalizeEmptyResponseMode(opts.emptyResponseMode);
     // 可见输出 = text / tool_use 块; thinking 不算 (客户端默认折叠, 计数为空回答)
     this.hasEmittedVisibleBlock = false;
+    // 已收到的思考内容, 供 emptyResponseMode=reasoning 时当正文回吐
+    this.thinkingText = '';
     // 供网关日志/落盘使用: 上游原始 finish_reason 与是否命中空响应兜底
     this.upstreamFinishReason = null;
     this.emptyResponseDetected = false;
+    this.emptyResponseSalvagedReasoning = false;
+    // 整条流是否出现过"真实" delta (推理/正文/工具调用): 只带 role / 空 delta /
+    // finish_reason 的 chunk 不算。false = 上游一个字都没吐 —— 网关可以在向客户端
+    // 写出任何帧之前丢弃本次转换结果、透明重试上游 (见 server.js EMPTY_RESPONSE_RETRIES)。
+    this.sawRealDelta = false;
   }
 
   frame(event, obj) {
     return `event: ${event}\ndata: ${JSON.stringify(obj)}\n\n`;
+  }
+
+  messageStartFrame() {
+    return this.frame('message_start', {
+      type: 'message_start',
+      message: {
+        id: this.messageId || '',
+        type: 'message',
+        role: 'assistant',
+        model: this.currentModel || '',
+        usage: this.latestUsage || { input_tokens: 0, output_tokens: 0 }
+      }
+    });
+  }
+
+  // 关闭所有已 start 的工具块 (收尾时调用, 与 stopNonToolBlock 配对)
+  closeOpenToolBlocks() {
+    const out = [];
+    if (this.openToolBlockIndices.size > 0) {
+      const sorted = [...this.openToolBlockIndices].sort((a, b) => a - b);
+      for (const index of sorted) {
+        out.push(this.frame('content_block_stop', { type: 'content_block_stop', index }));
+      }
+      this.openToolBlockIndices.clear();
+    }
+    return out;
   }
 
   // 关闭当前非工具块 (切块/收尾时调用)
@@ -721,12 +802,22 @@ class AnthropicStreamConverter {
   push(data) {
     const out = [];
     if (data.trim() === '[DONE]') {
+      // 零 delta 空流: 收尾帧推迟到 flush() —— 网关要在流结束处先判定是否透明重试
+      // (上游「完全空」响应在客户端眼里必须是零字节), [DONE] 提前把兜底帧写出去
+      // 会让"还没向客户端发出任何帧"的判定失效。
+      if (!this.hasSentMessageStart) return [];
       // 流正常结束: 发出缓存的 message_delta (含完整 usage) + message_stop
       const fallback = this.emptyResponseFallback();
       if (fallback && fallback.terminalError) {
         this.pendingMessageDelta = null;
         this.hasSentMessageStop = true; // 已用 error 事件收尾, 不再补 message_stop
         return fallback.frames;
+      }
+      // 整条流没有任何真实 delta (message_start 被 push 延迟) 时在这里补发,
+      // 保证 message_delta/message_stop 之前有 message_start。
+      if (!this.hasSentMessageStart) {
+        out.push(this.messageStartFrame());
+        this.hasSentMessageStart = true;
       }
       if (fallback) out.push(...fallback.frames);
       if (this.pendingMessageDelta) {
@@ -771,25 +862,26 @@ class AnthropicStreamConverter {
     const choice = (chunk.choices || [])[0];
     if (!choice) return out;
 
-    if (!this.hasSentMessageStart) {
-      out.push(this.frame('message_start', {
-        type: 'message_start',
-        message: {
-          id: this.messageId || '',
-          type: 'message',
-          role: 'assistant',
-          model: this.currentModel || '',
-          usage: chunkUsage || { input_tokens: 0, output_tokens: 0 }
-        }
-      }));
-      this.hasSentMessageStart = true;
-    }
-
     const delta = choice.delta || {};
 
     // reasoning (OpenRouter/Kimi 用 reasoning, DeepSeek 用 reasoning_content)
     const reasoning = delta.reasoning !== undefined ? delta.reasoning : delta.reasoning_content;
+
+    // message_start 延迟到第一个"真实" delta (推理/正文/工具调用) 才发: 只带 role /
+    // 空 delta / finish_reason 的 chunk 不触发。这样上游「零内容空 completion」
+    // (deepseek-v4-pro 长上下文偶发: 只发 finish_reason=stop 就收尾) 在客户端眼里
+    // 一个字节都没发出, 网关可以透明重试上游 (见 server.js EMPTY_RESPONSE_RETRIES)。
+    const hasRealDelta = (typeof reasoning === 'string' && reasoning !== '')
+      || (typeof delta.content === 'string' && delta.content !== '')
+      || (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0);
+    if (hasRealDelta) this.sawRealDelta = true;
+    if (!this.hasSentMessageStart && hasRealDelta) {
+      out.push(this.messageStartFrame());
+      this.hasSentMessageStart = true;
+    }
     if (typeof reasoning === 'string' && reasoning !== '') {
+      // 攒一份, 万一整条流只有 thinking 就用它当正文兜底 (EMPTY_RESPONSE_MODE 默认 auto)
+      this.thinkingText += reasoning;
       if (this.currentNonToolBlockType !== 'thinking') {
         out.push(...this.stopNonToolBlock());
         const index = this.nextContentIndex++;
@@ -928,13 +1020,7 @@ class AnthropicStreamConverter {
           }
         }
 
-        if (this.openToolBlockIndices.size > 0) {
-          const sorted = [...this.openToolBlockIndices].sort((a, b) => a - b);
-          for (const index of sorted) {
-            out.push(this.frame('content_block_stop', { type: 'content_block_stop', index }));
-          }
-          this.openToolBlockIndices.clear();
-        }
+        out.push(...this.closeOpenToolBlocks());
 
         this.pendingMessageDelta = {
           stopReason,
@@ -978,7 +1064,12 @@ class AnthropicStreamConverter {
     }
 
     const index = this.nextContentIndex++;
-    const text = emptyResponseNote(detail, this.upstreamFinishReason);
+    const text = emptyResponseFallbackText(
+      this.emptyResponseMode, detail, this.upstreamFinishReason, this.thinkingText
+    );
+    this.emptyResponseSalvagedReasoning = isEmptyResponseSalvaged(
+      this.emptyResponseMode, this.thinkingText
+    );
     this.hasEmittedVisibleBlock = true;
     return {
       terminalError: false,
@@ -998,7 +1089,7 @@ class AnthropicStreamConverter {
     };
   }
 
-  // 流结束但没收到 [DONE]: 补发缓存的 message_delta 和 message_stop
+  // 流结束: 补发缓存的 message_delta 和 message_stop; 上游没给 finish_reason 就断流时兜底。
   flush() {
     const out = [];
     let emitted = false;
@@ -1008,6 +1099,12 @@ class AnthropicStreamConverter {
         this.pendingMessageDelta = null;
         this.hasSentMessageStop = true;
         return fallback.frames;
+      }
+      // 整条流没有任何真实 delta (message_start 被 push 延迟了) 时在这里补发,
+      // 保证 message_delta/message_stop 之前有 message_start。
+      if (!this.hasSentMessageStart) {
+        out.push(this.messageStartFrame());
+        this.hasSentMessageStart = true;
       }
       if (fallback) out.push(...fallback.frames);
       out.push(this.frame('message_delta', {
@@ -1020,6 +1117,29 @@ class AnthropicStreamConverter {
       }));
       this.pendingMessageDelta = null;
       emitted = true;
+    } else if (!this.hasSentMessageStop) {
+      // 上游在发出 finish_reason 之前就结束了流 (没有 finish_reason、也没有 [DONE];
+      // 长上下文下模型返回完全空的 completion 时 LiteLLM 会这样直接关流)。
+      // 这里原来直接返回空数组 —— 客户端只会收到一个"只有 message_start 就断掉"的流,
+      // 既不报错也没有完成事件, Claude Code 表现为 query 静默停住、不提示完成。
+      // 与 Responses 侧 flush() 的 stream_truncated 对齐:
+      //   已经出过可见正文 -> 按 max_tokens 收尾, 客户端会据此续写;
+      //   一个字都没出     -> 发 error 事件, 让客户端报错并重试。
+      if (this.hasEmittedVisibleBlock) {
+        // 断流前已经开出去的块要先闭合, 否则客户端拿到的是残缺的事件序列
+        out.push(...this.stopNonToolBlock());
+        out.push(...this.closeOpenToolBlocks());
+        out.push(this.frame('message_delta', {
+          type: 'message_delta',
+          delta: { stop_reason: 'max_tokens', stop_sequence: null },
+          usage: this.latestUsage || { input_tokens: 0, output_tokens: 0 }
+        }));
+        emitted = true;
+      } else {
+        this.hasSentMessageStop = true; // 已用 error 事件收尾
+        return this.error('Upstream Chat Completions stream ended before sending '
+          + 'finish_reason (stream_truncated)');
+      }
     }
     if (emitted && !this.hasSentMessageStop) {
       out.push(this.frame('message_stop', { type: 'message_stop' }));
@@ -1904,7 +2024,11 @@ function chatCompletionToResponse(body, toolContext, opts = {}) {
       type: 'message',
       status: 'completed',
       role: 'assistant',
-      content: [{ type: 'output_text', text: emptyResponseNote(detail, finishReason), annotations: [] }]
+      content: [{
+        type: 'output_text',
+        text: emptyResponseFallbackText(emptyMode, detail, finishReason, reasoning),
+        annotations: []
+      }]
     });
   }
 
@@ -2007,6 +2131,10 @@ class ResponsesStreamConverter {
     // 供网关日志/落盘使用: 上游原始 finish_reason 与是否命中空响应兜底
     this.upstreamFinishReason = null;
     this.emptyResponseDetected = false;
+    this.emptyResponseSalvagedReasoning = false;
+    // 同 Anthropic 侧: 整条流是否出现过"真实" delta (推理/正文/工具调用)。
+    // false = 上游一个字都没吐, 网关可以透明重试上游 (见 server.js)。
+    this.sawRealDelta = false;
   }
 
   baseResponse(status, output) {
@@ -2310,9 +2438,14 @@ class ResponsesStreamConverter {
         )]
       };
     }
+    this.emptyResponseSalvagedReasoning = isEmptyResponseSalvaged(
+      this.emptyResponseMode, this.reasoning.text
+    );
     return {
       terminalError: false,
-      frames: this.pushTextDelta(emptyResponseNote(detail, this.finishReason))
+      frames: this.pushTextDelta(emptyResponseFallbackText(
+        this.emptyResponseMode, detail, this.finishReason, this.reasoning.text
+      ))
     };
   }
 
@@ -2445,7 +2578,11 @@ class ResponsesStreamConverter {
 
   // 输入一条上游 SSE "data:" 载荷, 返回出站帧
   push(data) {
-    if (data.trim() === '[DONE]') return this.finalize();
+    if (data.trim() === '[DONE]') {
+      // 同 Anthropic 侧: 零 delta 空流把收尾帧推迟到 flush(), 让网关先判定透明重试。
+      if (!this.responseStarted) return [];
+      return this.finalize();
+    }
     let chunk;
     try { chunk = JSON.parse(data); } catch { return []; }
 
@@ -2469,7 +2606,7 @@ class ResponsesStreamConverter {
     if (typeof chunk.model === 'string' && chunk.model !== '') this.model = chunk.model;
     if (typeof chunk.created === 'number') this.createdAt = chunk.created;
 
-    let out = [...this.ensureResponseStarted()];
+    let out = [];
     if (chunk.usage) this.latestUsage = chatUsageToResponsesUsage(chunk.usage);
 
     const choice = (chunk.choices || [])[0];
@@ -2477,6 +2614,16 @@ class ResponsesStreamConverter {
 
     const delta = choice.delta || {};
     const reasoning = extractReasoningFieldText(delta);
+    // response.created 延迟到第一个"真实" delta 才发 (同 Anthropic 侧 message_start
+    // 的延迟逻辑): 上游「零内容空 completion」时客户端一个字节都没收到, 网关可以
+    // 透明重试 (见 server.js EMPTY_RESPONSE_RETRIES)。finalize() 会在收尾时兜底补发。
+    if (!this.sawRealDelta
+        && (reasoning
+          || (typeof delta.content === 'string' && delta.content !== '')
+          || (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0))) {
+      this.sawRealDelta = true;
+      out.push(...this.ensureResponseStarted());
+    }
     if (reasoning) {
       out.push(...this.pushReasoningDelta(reasoning));
       this.appendReasoningToActiveTools(reasoning);
