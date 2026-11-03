@@ -445,34 +445,302 @@ function writeRecord(rec) {
   fileStream.write(JSON.stringify(r) + '\n');
 }
 
-// ---------- SSE 逐行打印 ----------
-function logSSELine(id, line) {
-  if (!line) {
-    console.log(`[#${id}] [SSE] (empty line)`);
-    return;
+// ---------- SSE 响应聚合 ----------
+// 流式响应不再逐帧打印/落盘: 把 SSE 事件折叠成最终的非流式响应对象, 流结束后
+// 只记录这一份完整结果 (与客户端最终拿到的响应同构), 避免日志被逐 token 的
+// 事件流淹没。支持 Anthropic Messages / OpenAI Responses / Chat Completions。
+class SSEResponseAggregator {
+  constructor() {
+    this.kind = null;      // 'anthropic' | 'responses' | 'chat'
+    this.eventName = '';
+    this.dataLines = [];
+    this.events = 0;
+    this.bytes = 0;
+    this.done = false;
+    this.error = null;
+    this.firstData = '';
+    this.lastData = '';
+    this.message = null;   // anthropic: 完整 Message
+    this.response = null;  // responses: response.completed 里的完整 Response
+    this.chat = null;      // chat: 聚合后的完整 ChatCompletion
   }
-  if (line.startsWith(':')) {
-    console.log(`[#${id}] [SSE comment] ${line}`);
-  } else if (line.startsWith('data:')) {
-    const data = line.slice(5).trimStart();
-    try {
-      const obj = JSON.parse(data);
-      console.log(`[#${id}] [SSE data]`);
-      console.log(indent(truncateText(JSON.stringify(obj, null, 2)), `[#${id}]   `));
-      // 顺手提取 token 用量 (Anthropic message_delta / OpenAI response.completed)
-      if (obj.message_delta && obj.message_delta.usage) {
-        console.log(`[#${id}] [usage] ${JSON.stringify(obj.message_delta.usage)}`);
-      }
-      if (obj.response && obj.response.usage) {
-        console.log(`[#${id}] [usage] ${JSON.stringify(obj.response.usage)}`);
-      }
-    } catch {
-      console.log(`[#${id}] [SSE data] ${truncateText(data)}`);
+
+  // 输入一行原始 SSE 文本 (转换模式下是出站帧, 透传模式下是上游原文)
+  pushLine(line) {
+    this.bytes += Buffer.byteLength(line, 'utf8') + 1;
+    if (line === '') {
+      this.dispatch();
+      return;
     }
-  } else {
-    const field = line.split(':')[0] || '?';
-    console.log(`[#${id}] [SSE ${field}] ${truncateText(line)}`);
+    if (line.startsWith(':')) return; // SSE 注释 / keep-alive
+    if (line.startsWith('event:')) {
+      this.eventName = line.slice(6).trim();
+      return;
+    }
+    if (!line.startsWith('data:')) return; // id: / retry: 忽略
+    let data = line.slice(5);
+    if (data.startsWith(' ')) data = data.slice(1);
+    this.dataLines.push(data);
   }
+
+  // 一个事件以空行结束: 解析 data: 载荷并折叠进最终响应
+  dispatch() {
+    this.eventName = '';
+    if (this.dataLines.length === 0) return;
+    const data = this.dataLines.join('\n');
+    this.dataLines = [];
+    this.events += 1;
+    if (this.firstData === '') this.firstData = data;
+    this.lastData = data;
+    const trimmed = data.trim();
+    if (trimmed === '[DONE]') {
+      this.done = true;
+      return;
+    }
+    let obj;
+    try { obj = JSON.parse(trimmed); } catch { return; }
+    if (obj === null || typeof obj !== 'object') return;
+    if (obj.error !== undefined && !Array.isArray(obj.choices)) {
+      this.error = obj.error;
+      this.done = true;
+      return;
+    }
+    const type = typeof obj.type === 'string' ? obj.type : '';
+    if (type === 'message_start' || type.startsWith('content_block_')
+        || type === 'message_delta' || type === 'message_stop') {
+      this.kind = 'anthropic';
+      this.onAnthropic(obj, type);
+    } else if (type.startsWith('response.')) {
+      this.kind = 'responses';
+      this.onResponses(obj, type);
+    } else if (Array.isArray(obj.choices)
+        || String(obj.object || '').startsWith('chat.completion')) {
+      this.kind = 'chat';
+      this.onChat(obj);
+    } else if (type === 'error') {
+      this.error = obj.error || obj;
+      this.done = true;
+    }
+  }
+
+  onAnthropic(obj, type) {
+    switch (type) {
+      case 'message_start': {
+        const msg = obj.message && typeof obj.message === 'object' ? obj.message : {};
+        this.message = {
+          type: 'message', role: 'assistant',
+          ...msg,
+          content: Array.isArray(msg.content) ? msg.content.slice() : []
+        };
+        break;
+      }
+      case 'content_block_start': {
+        if (!this.message) this.message = { type: 'message', role: 'assistant', content: [] };
+        if (!Array.isArray(this.message.content)) this.message.content = [];
+        const block = { ...(obj.content_block || {}) };
+        if (block.type === 'tool_use') block._partialJson = '';
+        const index = typeof obj.index === 'number' ? obj.index : this.message.content.length;
+        this.message.content[index] = block;
+        break;
+      }
+      case 'content_block_delta': {
+        if (!this.message) this.message = { type: 'message', role: 'assistant', content: [] };
+        if (!Array.isArray(this.message.content)) this.message.content = [];
+        const d = obj.delta || {};
+        const last = this.message.content.length - 1;
+        const index = typeof obj.index === 'number' ? obj.index : (last >= 0 ? last : 0);
+        let block = this.message.content[index];
+        if (!block) {
+          // 防御: 少数上游省略 content_block_start/index, 按 delta 类型补一个块
+          block = d.type === 'thinking_delta' ? { type: 'thinking', thinking: '' }
+            : d.type === 'input_json_delta' ? { type: 'tool_use', id: '', name: '', input: {}, _partialJson: '' }
+            : { type: 'text', text: '' };
+          this.message.content[index] = block;
+        }
+        if (d.type === 'text_delta') block.text = (block.text || '') + (d.text || '');
+        else if (d.type === 'thinking_delta') block.thinking = (block.thinking || '') + (d.thinking || '');
+        else if (d.type === 'signature_delta') block.signature = d.signature;
+        else if (d.type === 'input_json_delta') block._partialJson = (block._partialJson || '') + (d.partial_json || '');
+        else if (d.type === 'citations_delta') (block.citations = block.citations || []).push(d.citation);
+        break;
+      }
+      case 'content_block_stop': {
+        const content = this.message && this.message.content;
+        if (!Array.isArray(content)) break;
+        const index = typeof obj.index === 'number' ? obj.index : content.length - 1;
+        const block = content[index];
+        if (block && block.type === 'tool_use') {
+          if (block._partialJson) {
+            try { block.input = JSON.parse(block._partialJson); }
+            catch { block.input = block._partialJson; }
+          } else if (block.input === undefined) {
+            block.input = {};
+          }
+          delete block._partialJson;
+        }
+        break;
+      }
+      case 'message_delta': {
+        if (!this.message) break;
+        const d = obj.delta || {};
+        if (d.stop_reason !== undefined) this.message.stop_reason = d.stop_reason;
+        if (d.stop_sequence !== undefined) this.message.stop_sequence = d.stop_sequence;
+        if (obj.usage) this.message.usage = { ...(this.message.usage || {}), ...obj.usage };
+        break;
+      }
+      case 'message_stop':
+        this.done = true;
+        break;
+      default:
+        break;
+    }
+  }
+
+  onResponses(obj, type) {
+    if (type === 'response.completed' || type === 'response.incomplete' || type === 'response.failed') {
+      if (obj.response && typeof obj.response === 'object') this.response = obj.response;
+      if (type === 'response.failed') {
+        this.error = (obj.response && obj.response.error) || { message: 'response failed' };
+      }
+      this.done = true;
+    } else if (type === 'error') {
+      this.error = obj.error || obj;
+      this.done = true;
+    }
+  }
+
+  onChat(obj) {
+    if (!this.chat) {
+      this.chat = {
+        id: obj.id || '',
+        object: 'chat.completion',
+        created: obj.created || 0,
+        model: obj.model || '',
+        choices: []
+      };
+    }
+    if (obj.id) this.chat.id = obj.id;
+    if (obj.model) this.chat.model = obj.model;
+    if (typeof obj.created === 'number') this.chat.created = obj.created;
+    if (obj.usage) this.chat.usage = obj.usage;
+
+    const choice = (obj.choices || [])[0];
+    if (!choice) return;
+    const index = typeof choice.index === 'number' ? choice.index : 0;
+    let state = this.chat.choices.find((c) => c.index === index);
+    if (!state) {
+      state = { index, message: { role: 'assistant', content: '' }, finish_reason: null };
+      this.chat.choices.push(state);
+    }
+    const delta = choice.delta || choice.message || {};
+    if (delta.role) state.message.role = delta.role;
+    if (typeof delta.content === 'string') state.message.content += delta.content;
+    // reasoning_content > reasoning > reasoning_details (与 convert.js 一致)
+    const reasoning = convert.extractReasoningFieldText(delta);
+    if (reasoning) {
+      state.message.reasoning_content = (state.message.reasoning_content || '') + reasoning;
+    }
+    if (Array.isArray(delta.tool_calls)) {
+      state.message.tool_calls = state.message.tool_calls || [];
+      for (const tc of delta.tool_calls) {
+        const tcIndex = typeof tc.index === 'number' ? tc.index : state.message.tool_calls.length;
+        let call = state.message.tool_calls[tcIndex];
+        if (!call) {
+          call = { id: '', type: 'function', function: { name: '', arguments: '' } };
+          state.message.tool_calls[tcIndex] = call;
+        }
+        if (tc.id) call.id = tc.id;
+        if (tc.type) call.type = tc.type;
+        const fn = tc.function || {};
+        if (typeof fn.name === 'string' && fn.name !== '') call.function.name += fn.name;
+        if (typeof fn.arguments === 'string') call.function.arguments += fn.arguments;
+      }
+    }
+    if (choice.finish_reason !== undefined) state.finish_reason = choice.finish_reason;
+  }
+
+  // 折叠结果; 可重复调用 (正常结束与客户端中断共用)
+  result() {
+    this.dispatch(); // 收尾没有以空行结束的最后一个事件
+
+    if (this.kind === 'responses' && this.response) return this.response;
+    if (this.kind === 'anthropic' && this.message) {
+      return this.error
+        ? { type: 'error', error: this.error, partial_message: this.message }
+        : this.message;
+    }
+    if (this.kind === 'chat' && this.chat) {
+      return this.error
+        ? { type: 'error', error: this.error, partial_response: this.chat }
+        : this.chat;
+    }
+    if (this.error) return { type: 'error', error: this.error, sse_events: this.events };
+    // 无法识别的流只给摘要, 不保存完整 SSE 原文
+    const preview = (s) => (s.length > 2000 ? s.slice(0, 2000) + '…' : s);
+    return {
+      type: 'sse_summary',
+      sse_events: this.events,
+      sse_bytes: this.bytes,
+      done: this.done,
+      ...(this.firstData !== '' ? { first_data: preview(this.firstData) } : {}),
+      ...(this.lastData !== '' ? { last_data: preview(this.lastData) } : {})
+    };
+  }
+}
+
+// 流结束后打印一次完整响应, 并把同一份 JSON 作为 record.response_body 落盘
+function logCompleteResponse(id, agg, upstreamSseBytes, result) {
+  const payload = result === undefined ? agg.result() : result;
+  const body = JSON.stringify(payload);
+  console.log(`[#${id}] response body (SSE → complete response, ${Buffer.byteLength(body)} bytes`
+    + (upstreamSseBytes !== undefined ? `; 上游 SSE ${upstreamSseBytes} bytes` : '') + '):');
+  console.log(indent(truncateText(JSON.stringify(payload, null, 2)), `[#${id}]   `));
+  return body;
+}
+
+// 上游返回"没有可见输出"的响应时统一告警并落盘诊断字段。
+// 最常见的是 reasoning-only: reasoning 有内容、content 为空 (思考型模型把整段答案
+// 写进 reasoning 通道后直接 stop, 参见 BerriAI/litellm#38199)。
+// 返回 true 表示这是一次 reasoning-only。
+function reportNoVisibleOutput(id, record, diag, opts = {}) {
+  if (!diag || diag.has_visible_output) return false;
+  const reasoningChars = diag.reasoning_chars || 0;
+  const reasoningBlocks = diag.reasoning_blocks || 0;
+  const reasoningOnly = reasoningChars > 0 || reasoningBlocks > 0;
+  const contentChars = diag.content_chars || 0;
+  const toolCalls = diag.tool_calls || 0;
+  const label = reasoningOnly ? 'reasoning-only' : 'empty-response';
+  let outcome = opts.outcome || '原样透传 (客户端会看到空正文)';
+  if (!opts.outcome) {
+    const mode = opts.emptyMode;
+    if (opts.applied === false) {
+      outcome = mode === 'pass'
+        ? '原样透传 (客户端会看到 Done 但没有输出)'
+        : `未兜底 (finish_reason=${diag.finish_reason || '?'})`;
+    } else if (mode === 'auto' && reasoningOnly) {
+      outcome = '已把 reasoning 当正文回吐';
+    } else if (mode === 'error' && opts.stream) {
+      outcome = '已发 error 事件中止本轮';
+    } else {
+      outcome = '已补说明文本';
+    }
+  }
+  console.log(`[#${id}] [WARN] ${label}: 上游没有可见输出`
+    + ` (finish=${diag.finish_reason || '?'}, reasoning=${reasoningChars} chars`
+    + (reasoningBlocks > 1 ? `/${reasoningBlocks} blocks` : '')
+    + `, content=${contentChars} chars, tool_calls=${toolCalls}`
+    + (opts.model ? `, 模型=${opts.model}` : '')
+    + (opts.emptyMode ? `, EMPTY_RESPONSE_MODE=${opts.emptyMode}` : '')
+    + `) — ${outcome}`);
+  record.empty_response = true;
+  record.reasoning_only = reasoningOnly;
+  record.reasoning_chars = reasoningChars;
+  record.content_chars = contentChars;
+  record.tool_calls = toolCalls;
+  if (diag.finish_reason) record.upstream_finish_reason = diag.finish_reason;
+  if (opts.emptyMode) record.empty_response_mode = opts.emptyMode;
+  if (opts.salvaged !== undefined) record.empty_response_salvaged = opts.salvaged;
+  return reasoningOnly;
 }
 
 // ---------- 转发逻辑 ----------
@@ -641,9 +909,10 @@ function handleRequest(req, res, body, id) {
     activeUpReq = upReq;
 
     // 已收到的响应分片/帧, 供客户端断开时补写记录
-    const upstreamChunks = [];  // convert 分支: 上游原始 SSE 分片
-    const convertedChunks = []; // convert 分支: 转换后出站帧
+    let upstreamSseBytes = 0;   // convert 分支: 上游原始 SSE 字节数 (只计数, 不保留原文)
+    let convertedFrames = 0;    // convert 分支: 已写给客户端的帧数 (透明重试判据)
     const bodyParts = [];       // 直通/非流式分支: 响应分片
+    let respAggregator = null;  // SSE 分支: 把事件流折叠成完整响应
 
     // 首字节超时: 只约束"响应到达前", 响应开始后解除 (LLM 流式响应可能持续很久)
     let responseStarted = false;
@@ -696,9 +965,14 @@ function handleRequest(req, res, body, id) {
             record.aborted = true;
           }
           // upRes 'end' 不会再触发: 就地补写记录, 避免丢 usage 账目
-          if (upstreamChunks.length) record.response_body_upstream = Buffer.concat(upstreamChunks).toString('utf8');
-          if (convertedChunks.length) record.response_body = convertedChunks.join('');
-          if (!record.response_body && bodyParts.length) record.response_body = Buffer.concat(bodyParts).toString('utf8');
+          if (upstreamSseBytes) record.upstream_sse_bytes = upstreamSseBytes;
+          if (respAggregator) {
+            record.response_body = logCompleteResponse(id, respAggregator);
+            record.sse_events = respAggregator.events;
+            record.sse_bytes = respAggregator.bytes;
+          } else if (bodyParts.length) {
+            record.response_body = Buffer.concat(bodyParts).toString('utf8');
+          }
           saveRecord();
         }
       });
@@ -778,12 +1052,13 @@ function handleRequest(req, res, body, id) {
                   attachReasoning: ATTACH_REASONING,
                   emptyResponseMode: EMPTY_RESPONSE_MODE
                 });
+            const sseAgg = new SSEResponseAggregator();
+            respAggregator = sseAgg;
             const writeFrames = (frames) => {
               for (const frame of frames) {
-                convertedChunks.push(frame);
-                for (const fline of frame.split('\n')) {
-                  if (fline) logSSELine(id, fline);
-                }
+                convertedFrames += 1;
+                // 只喂聚合器, 不逐帧打印; 空行也要保留 (它是事件分隔符)
+                for (const fline of frame.split('\n')) sseAgg.pushLine(fline);
                 if (isTerminalFrame(frame)) streamCompleted = true;
                 if (res.writableEnded) return;
                 if (!res.write(frame)) {
@@ -800,7 +1075,7 @@ function handleRequest(req, res, body, id) {
               writeFrames(streamConv.push(data));
             };
             upResX.on('data', (chunk) => {
-              upstreamChunks.push(chunk);
+              upstreamSseBytes += chunk.length;
               lineBuf += chunk.toString('utf8');
               let idx;
               while ((idx = lineBuf.indexOf('\n')) !== -1) {
@@ -815,7 +1090,7 @@ function handleRequest(req, res, body, id) {
               // 透明重试判据: 客户端零字节已写出 + 上游一个真实 delta 都没吐 +
               // 以 stop 收尾或直接断流。content_filter / tool_calls / 已出思考等不重试。
               const finish = streamConv.upstreamFinishReason;
-              if (convertedChunks.length === 0
+              if (convertedFrames === 0
                   && !streamConv.sawRealDelta
                   && (finish === 'stop' || finish === null)
                   && attempt < EMPTY_RESPONSE_RETRIES
@@ -833,22 +1108,49 @@ function handleRequest(req, res, body, id) {
                 console.log(`[#${id}] upstream finish_reason: ${streamConv.upstreamFinishReason}`);
                 record.upstream_finish_reason = streamConv.upstreamFinishReason;
               }
-              if (streamConv.emptyResponseDetected) {
-                console.log(`[#${id}] [WARN] 上游空响应: finish_reason=${streamConv.upstreamFinishReason || '?'},`
-                  + ` 没有任何可见输出 (模型=${streamConv.currentModel || '?'},`
-                  + ` 兜底策略=${EMPTY_RESPONSE_MODE}`
-                  + (streamConv.emptyResponseSalvagedReasoning
-                    ? `, 已把 ${streamConv.thinkingText.length} 字符思考内容当正文回吐`
-                    : '')
-                  + (attempt > 0 ? `, 已透明重试 ${attempt} 次` : '')
-                  + ')');
-                for (const l of outboundTailLines(outBody)) {
-                  console.log(`[#${id}]        出站末段 ${l}`);
+              // 追踪 reasoning-only / 空响应: 只要上游没有产出可见输出就记一条,
+              // 包括 finish_reason=length 等没走空响应兜底的情形。
+              const upstreamDiag = streamConv.diagnostics();
+              if (upstreamDiag && !upstreamDiag.has_visible_output) {
+                const reasoningOnly = (upstreamDiag.reasoning_chars || 0) > 0
+                  || (upstreamDiag.reasoning_blocks || 0) > 0;
+                let outcome;
+                if (streamConv.emptyResponseDetected) {
+                  if (EMPTY_RESPONSE_MODE === 'pass') {
+                    outcome = '原样透传 (客户端会看到 Done 但没有输出)';
+                  } else if (EMPTY_RESPONSE_MODE === 'error') {
+                    outcome = '已发 error 事件中止本轮';
+                  } else if (EMPTY_RESPONSE_MODE === 'auto' && reasoningOnly) {
+                    outcome = '已把 reasoning 当正文回吐';
+                  } else {
+                    outcome = '已补说明文本';
+                  }
+                } else if (upstreamDiag.finish_reason === 'length') {
+                  outcome = '未兜底 (finish_reason=length, 客户端会看到截断)';
+                } else if (upstreamDiag.finish_reason === null) {
+                  outcome = '上游断流, 已发 error 事件';
+                } else {
+                  outcome = `未兜底 (finish_reason=${upstreamDiag.finish_reason})`;
                 }
-                record.empty_response = true;
+                if (attempt > 0) outcome += `, 已透明重试 ${attempt} 次`;
+                reportNoVisibleOutput(id, record, upstreamDiag, {
+                  emptyMode: EMPTY_RESPONSE_MODE,
+                  stream: true,
+                  model: streamConv.currentModel || streamConv.model || '',
+                  applied: streamConv.emptyResponseDetected && EMPTY_RESPONSE_MODE !== 'pass',
+                  salvaged: streamConv.emptyResponseSalvagedReasoning,
+                  outcome
+                });
+                if (streamConv.emptyResponseDetected) {
+                  for (const l of outboundTailLines(outBody)) {
+                    console.log(`[#${id}]        出站末段 ${l}`);
+                  }
+                }
               }
-              record.response_body_upstream = Buffer.concat(upstreamChunks).toString('utf8');
-              record.response_body = convertedChunks.join('');
+              if (upstreamSseBytes) record.upstream_sse_bytes = upstreamSseBytes;
+              record.response_body = logCompleteResponse(id, sseAgg, upstreamSseBytes);
+              record.sse_events = sseAgg.events;
+              record.sse_bytes = sseAgg.bytes;
               saveRecord();
               res.end();
             });
@@ -862,17 +1164,42 @@ function handleRequest(req, res, body, id) {
             let out = raw;
             try {
               const parsed = JSON.parse(raw.toString('utf8'));
-              out = Buffer.from(JSON.stringify(
-                upRes.statusCode >= 400
-                  ? (convertKind === 'anthropic'
-                      ? convert.chatErrorToAnthropicError(parsed)
-                      : convert.chatErrorToResponseError(parsed))
-                  : (convertKind === 'anthropic'
-                  ? convert.openaiToAnthropic(parsed, { emptyResponseMode: EMPTY_RESPONSE_MODE })
-                  : convert.chatCompletionToResponse(parsed, toolContext, {
-                      emptyResponseMode: EMPTY_RESPONSE_MODE
-                    }))
-              ));
+              const upstreamDiag = upRes.statusCode >= 400
+                ? null : convert.diagnoseResponse(parsed);
+              const converted = upRes.statusCode >= 400
+                ? (convertKind === 'anthropic'
+                    ? convert.chatErrorToAnthropicError(parsed)
+                    : convert.chatErrorToResponseError(parsed))
+                : (convertKind === 'anthropic'
+                ? convert.openaiToAnthropic(parsed, { emptyResponseMode: EMPTY_RESPONSE_MODE })
+                : convert.chatCompletionToResponse(parsed, toolContext, {
+                    emptyResponseMode: EMPTY_RESPONSE_MODE
+                  }));
+              out = Buffer.from(JSON.stringify(converted));
+              if (upstreamDiag && !upstreamDiag.has_visible_output) {
+                const convertedDiag = convert.diagnoseResponse(converted);
+                const applied = !!(convertedDiag && convertedDiag.has_visible_output);
+                const reasoningOnly = (upstreamDiag.reasoning_chars || 0) > 0
+                  || (upstreamDiag.reasoning_blocks || 0) > 0;
+                let outcome;
+                if (!applied) {
+                  outcome = EMPTY_RESPONSE_MODE === 'pass'
+                    ? '原样透传 (客户端会看到空正文)'
+                    : `未兜底 (finish_reason=${upstreamDiag.finish_reason || '?'})`;
+                } else if (EMPTY_RESPONSE_MODE === 'auto' && reasoningOnly) {
+                  outcome = '已把 reasoning 当正文回吐';
+                } else {
+                  outcome = '已补说明文本 (非流式)';
+                }
+                reportNoVisibleOutput(id, record, upstreamDiag, {
+                  emptyMode: EMPTY_RESPONSE_MODE,
+                  stream: false,
+                  model: parsed.model || '',
+                  applied,
+                  salvaged: applied && EMPTY_RESPONSE_MODE === 'auto' && reasoningOnly,
+                  outcome
+                });
+              }
             } catch (e) {
               console.error(`[#${id}] convert response failed (${e.message}), 原样透传`);
               out = raw;
@@ -887,11 +1214,12 @@ function handleRequest(req, res, body, id) {
           });
         }
       } else if (isSSE) {
-        // 流式: 边转发边打印, 按行解析 SSE
+        // 流式: 边转发边聚合, 流结束后只记录一次完整响应 (不逐帧打印)
         res.writeHead(upRes.statusCode, respHeaders);
+        const sseAgg = new SSEResponseAggregator();
+        respAggregator = sseAgg;
         let lineBuf = '';
         upRes.on('data', (chunk) => {
-          bodyParts.push(chunk);
           lineBuf += chunk.toString('utf8');
           let idx;
           while ((idx = lineBuf.indexOf('\n')) !== -1) {
@@ -900,7 +1228,7 @@ function handleRequest(req, res, body, id) {
             if (line === 'data: [DONE]' || line.startsWith('event: message_stop') || line.startsWith('event: error')) {
               streamCompleted = true;
             }
-            logSSELine(id, line);
+            sseAgg.pushLine(line);
           }
           // 背压: 客户端写不动时暂停上游
           if (!res.write(chunk)) {
@@ -909,8 +1237,20 @@ function handleRequest(req, res, body, id) {
           }
         });
         upRes.on('end', () => {
-          if (lineBuf) logSSELine(id, lineBuf);
-          record.response_body = Buffer.concat(bodyParts).toString('utf8');
+          if (lineBuf) sseAgg.pushLine(lineBuf);
+          const aggResult = sseAgg.result();
+          const diag = convert.diagnoseResponse(aggResult);
+          if (diag && !diag.has_visible_output) {
+            reportNoVisibleOutput(id, record, diag, {
+              model: aggResult.model || '',
+              outcome: diag.finish_reason === 'length' || diag.finish_reason === 'incomplete'
+                ? '原样透传 (上游截断)'
+                : '原样透传 (客户端会看到空正文)'
+            });
+          }
+          record.response_body = logCompleteResponse(id, sseAgg, undefined, aggResult);
+          record.sse_events = sseAgg.events;
+          record.sse_bytes = sseAgg.bytes;
           saveRecord();
           res.end();
         });
@@ -920,6 +1260,17 @@ function handleRequest(req, res, body, id) {
         upRes.on('data', (chunk) => bodyParts.push(chunk));
         upRes.on('end', () => {
           const respBody = Buffer.concat(bodyParts);
+          // 追踪 reasoning-only / 空正文 (纯透传, 不改变响应本身)
+          try {
+            const parsed = JSON.parse(respBody.toString('utf8'));
+            const diag = convert.diagnoseResponse(parsed);
+            if (diag && !diag.has_visible_output) {
+              reportNoVisibleOutput(id, record, diag, {
+                model: parsed.model || '',
+                outcome: '原样透传 (客户端会看到空正文)'
+              });
+            }
+          } catch { /* 非 JSON 响应, 忽略 */ }
           console.log(`[#${id}] response body (${respBody.length} bytes):`);
           console.log(indent(truncateText(prettyBody(respBody)), `[#${id}]   `));
           record.response_body = respBody.toString('utf8');

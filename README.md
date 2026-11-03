@@ -2,7 +2,7 @@
 
 把 Claude Code CLI 或 Codex CLI 的 base_url 指向本 gateway,gateway 会:
 
-1. **打印记录** 每次出站 HTTP 请求的 payload(headers + body)和响应(状态 + body,SSE 流逐事件打印);
+1. **打印记录** 每次出站 HTTP 请求的 payload(headers + body)和响应(状态 + body;SSE 流会聚合成一份完整响应后记录,不再逐帧打印);
 2. **转发** 到指定的外部服务器 `UPSTREAM_URL`,并用 `UPSTREAM_TOKEN` 重写 Authorization(两者必填,缺失时启动报错退出);
 3. **协议转换** (默认全开,设 `CONVERT_ANTHROPIC=0`/`CONVERT_RESPONSES=0` 关闭):把 Anthropic Messages /
    OpenAI Responses 请求转换为 Chat Completions 发给只支持 chat 的上游,响应再转回客户端协议。
@@ -78,7 +78,8 @@ node server.js
 - **chat → Anthropic**: SSE 逐事件转换 (message_start / thinking / text / tool_use /
   input_json_delta / message_delta / message_stop),message_delta 缓存到 `[DONE]`
   统一发出保证 usage 完整;usage 按 `input + cache_read + cache_creation == prompt_tokens`
-  拆分。
+  拆分。思考内容按 `reasoning_content` > `reasoning`(字符串/对象) > `reasoning_details`
+  提取 (与 cc-switch 一致);空字符串占位忽略,不会产生空 thinking 块。
 - **Responses → chat**: instructions → system;function_call/custom_tool_call/tool_search_call
   → `tool_calls`(namespace 压平为 `ns__name`);function_call_output → tool 消息;
   reasoning 前向/回溯附挂(仅 `ATTACH_REASONING=1` 时输出 `reasoning_content`);
@@ -135,9 +136,16 @@ wire_api = "responses"
 [#3] outbound headers : { ..., "authorization": "Bearer ***" }
 ================ RESP #3 <- 200 OK in 218 ms ================
 [#3] response headers : { "content-type": "text/event-stream", ... }
-[#3] [SSE data]
-[#3]   { "type": "content_block_delta", "delta": { "type": "text_delta", "text": "..." } }
-[#3] [usage] {"output_tokens":25}
+[#3] response body (SSE → complete response, 290 bytes; 上游 SSE 1016 bytes):
+[#3]   {
+[#3]     "type": "message",
+[#3]     "role": "assistant",
+[#3]     "id": "...",
+[#3]     "model": "...",
+[#3]     "content": [ { "type": "text", "text": "..." } ],
+[#3]     "stop_reason": "end_turn",
+[#3]     "usage": { "input_tokens": 7, "output_tokens": 25 }
+[#3]   }
 ```
 
 ## 出站代理 (Network Proxy)
@@ -174,8 +182,9 @@ Node 核心 `http`/`https` **不会自动读取代理环境变量**,gateway 已�
 - 日志中 `proxy : (direct)` 但网络要求代理 → 启动该 gateway 的 shell 没继承代理环境变量,加 `GATEWAY_PROXY` 即可(启动时也会有 WARN)
 
 客户端 (Claude Code / Codex CLI) 里显示 **"Done 但没有任何输出"**:
-- 看 gateway 日志里的 `[#n] upstream finish_reason: ...` 与 `[#n] [WARN] 上游空响应: ...`
-  —— 上游返回了 `200` 但整条流没有任何可见 `content`(只见 `thinking`/`reasoning`,或什么都没有)。
+- 看 gateway 日志里的 `[#n] upstream finish_reason: ...` 与
+  `[#n] [WARN] reasoning-only: ...`(或 `empty-response`)—— 上游返回了 `200`
+  但没有任何可见 `content`(只见 `thinking`/`reasoning`,或什么都没有)。
   这类空响应的 `finish_reason` 是 `stop`(模型自己停)或 `content_filter`(Azure 内容过滤拦截),
   后者在 Anthropic 侧映射成 `stop_reason=refusal`、在 Responses 侧映射成
   `status=incomplete` + `incomplete_details.reason=content_filter`,而不是伪装成正常完成。
@@ -193,8 +202,23 @@ Node 核心 `http`/`https` **不会自动读取代理环境变量**,gateway 已�
   `[#n] [WARN] 上游空响应 (finish_reason=stop, 客户端零字节已写出) — 透明重试 1/1`;
   重试拿到正常响应时客户端直接得到真答案,你感知不到发生过空响应。重试次数用尽或
   设 `EMPTY_RESPONSE_RETRIES=0` 才落到 `EMPTY_RESPONSE_MODE` 兜底。
-- 若频繁出现,可配合 `LOG_FILE=/tmp/gw.jsonl` 抓 `response_body_upstream` 看到上游原始 SSE,
+- 若频繁出现,可配合 `LOG_FILE=/tmp/gw.jsonl` 看 `response_body`(SSE 聚合后的完整响应,
+  含 `usage` 与 `upstream_finish_reason`; 流式响应不再保存逐帧 SSE 原文),
   并试 `ATTACH_REASONING=1`(DeepSeek 系思考模型要求把历史 reasoning 回传)。
+- **reasoning-only 追踪**: 只要上游没有可见输出 (典型: `reasoning` 有内容、`content`
+  为空),四条路径 (转换/透传 × 流式/非流式) 都会打一条可检索的 WARN 并落盘诊断字段
+  (纯透传只记录,不改响应):
+
+  ```
+  [#3] [WARN] reasoning-only: 上游没有可见输出 (finish=stop, reasoning=1234 chars,
+        content=0 chars, tool_calls=0, EMPTY_RESPONSE_MODE=auto) — 已把 reasoning 当正文回吐
+  ```
+
+  `finish_reason=length` 等没走兜底的情形也会打印
+  `— 未兜底 (finish_reason=length, 客户端会看到截断)`。JSONL 字段:
+  `reasoning_only` / `reasoning_chars` / `content_chars` / `tool_calls` /
+  `empty_response` / `empty_response_mode` / `empty_response_salvaged` /
+  `upstream_finish_reason`。
 
 Claude Code 的一个特有诱因(已实测复现,见下):后台任务通知被以 `role:"system"` 追加在
 `messages` 末尾。同一份请求体只把末条 `role` 从 `system` 改成 `user`,上游就从
@@ -207,11 +231,12 @@ Claude Code 的一个特有诱因(已实测复现,见下):后台任务通知被�
 `400 BadRequestError: System message must be at the beginning.`,客户端重试多少次都一样 ——
 空响应只是质量退化,400 是整轮不可用,两害相权取后者修复。
 
-若真的拿到空响应, 日志除了原来的 `[#n] [WARN] 上游空响应:` 之外, 还会额外打印出站消息末段,
-直接指出是哪条 prompt 触发的:
+若真的拿到空响应, 日志的 `[#n] [WARN] reasoning-only:` / `empty-response:` 之外,
+还会额外打印出站消息末段, 直接指出是哪条 prompt 触发的:
 
 ```
-[#16] [WARN] 上游空响应: finish_reason=stop, 没有任何可见输出 (兜底策略=text)
+[#16] [WARN] reasoning-only: 上游没有可见输出 (finish=stop, reasoning=0 chars,
+      content=0 chars, tool_calls=0, EMPTY_RESPONSE_MODE=text) — 已补说明文本
 [#16]        出站末段 #154 tool(1234B): ...
 [#16]        出站末段 #155 assistant(56B): ...
 [#16]        出站末段 #156 system(1532B): [SYSTEM NOTIFICATION - NOT USER INPUT] …
@@ -256,7 +281,7 @@ A/B 实测记录(`deepseek-v4-flash-0731`,同一份 131 条消息的历史请求
 ### 再一类: 上游断流(没有 `finish_reason`、也没有 `[DONE]`)
 
 同一条退化路径上还有更狠的一种 —— 上游(通常是模型返回**完全空的 completion**,连 reasoning
-都没有)连 `finish_reason` 都不发就把 SSE 连接关了。日志里的特征很干净: 该请求只有
+都没有)连 `finish_reason` 都不发就把 SSE 连接关了。旧版逐帧日志里的特征很干净: 该请求只有
 `RESP #N <- 200 OK` 和一条 `event: message_start`,之后再无任何事件;搜 `client disconnected`
 是 0 次(所以不是客户端断开),而 `message_start` 之后的**下一个** `[#M] upstream normalize`
 就是下一条请求了。
@@ -278,11 +303,11 @@ Responses 侧的 `stream_truncated` 语义(无条件生效,不受 `EMPTY_RESPONS
 
 ## 实现说明
 
-- **流式(SSE)**: 边转发边按行解析打印,带背压处理(`drain` 时暂停上游);自动提取 `message_delta.usage` / `response.usage` 打印 token 用量。转换模式下 SSE 逐行喂给 `convert.js` 的流式转换器,出站帧逐事件打印并写回客户端。
+- **流式(SSE)**: 边转发边按行解析,带背压处理(`drain` 时暂停上游)。转换模式下 SSE 逐行喂给 `convert.js` 的流式转换器,出站帧写回客户端。日志侧只把事件流折叠成一份完整响应(Anthropic Message / Responses Response / Chat Completion),流结束后打印一次并写入 `response_body`;不再逐帧打印或保存 SSE 原文。
 - **非流式**: 攒完整 body,打印后一次性回给客户端(转换模式先转换再返回,转换失败时原样透传)。
 - **请求体**: 先缓冲完整请求再转发,保证 payload 完整记录(CLI 请求体都很小)。
 - **转发时**剥离逐跳头(connection/transfer-encoding 等)和 `accept-encoding`,强制上游返回明文以便记录;转换模式额外剥离 `anthropic-version`/`anthropic-beta`/`x-api-key`,并改写出站 path 为 chat completions 端点。
-- **记录**: JSONL 记录(转换模式)同时含原始请求体(`request_body_original`)、转换后请求体(`request_body`)与上游原始响应体(`response_body_upstream`)。
+- **记录**: JSONL 记录(转换模式)同时含原始请求体(`request_body_original`)、转换后请求体(`request_body`)与响应体(`response_body`;streaming 时为聚合后的完整响应,另附 `sse_events`/`sse_bytes`,非 streaming 时另含上游原始响应体 `response_body_upstream`)。
 - **客户端中断**: 自动终止上游请求;上游错误返回 502。
 
 ## 本地联调

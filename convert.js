@@ -580,12 +580,150 @@ function responseOutputHasVisibleItem(output) {
   });
 }
 
-// chat message 里的思考内容 (DeepSeek/Kimi 用 reasoning_content, OpenRouter 用 reasoning)
+// chat message 里的思考内容: reasoning_content > reasoning(字符串/对象) >
+// reasoning_details (与 cc-switch transform.rs 的提取优先级一致)
 function messageReasoningText(message) {
-  if (!message) return '';
-  const v = message.reasoning_content !== undefined
-    ? message.reasoning_content : message.reasoning;
-  return typeof v === 'string' ? v : '';
+  return extractReasoningFieldText(message) || '';
+}
+
+// ---------------------------------------------------------------------------
+// 响应诊断: 上游是否"有 reasoning、但没有可见输出"。
+// 这是思考型模型把整段答案写进 reasoning 通道后直接 stop 的退化形态
+// (LiteLLM 同类问题见 BerriAI/litellm#38199), 供网关日志/JSONL 统一追踪。
+// 支持三种形态: Chat Completions (含 SSE 聚合结果) / Anthropic Messages / Responses。
+// ---------------------------------------------------------------------------
+function diagnoseResponse(body) {
+  if (!body || typeof body !== 'object') return null;
+
+  // Chat Completions (message 或 SSE 聚合后的 message)
+  if (Array.isArray(body.choices) && body.choices.length > 0) {
+    const choice = body.choices[0] || {};
+    const message = choice.message || choice.delta || {};
+    const reasoning = messageReasoningText(message);
+    let contentChars = 0;
+    let visible = false;
+    if (typeof message.content === 'string') {
+      contentChars += message.content.length;
+      if (message.content.trim() !== '') visible = true;
+    } else if (Array.isArray(message.content)) {
+      for (const part of message.content) {
+        if (!part || typeof part !== 'object') continue;
+        if ((part.type === 'text' || part.type === 'output_text')
+            && typeof part.text === 'string') {
+          contentChars += part.text.length;
+          if (part.text.trim() !== '') visible = true;
+        } else if (part.type === 'refusal' && typeof part.refusal === 'string') {
+          contentChars += part.refusal.length;
+          if (part.refusal.trim() !== '') visible = true;
+        }
+      }
+    }
+    if (typeof message.refusal === 'string' && message.refusal.trim() !== '') {
+      contentChars += message.refusal.length;
+      visible = true;
+    }
+    const toolCalls = (Array.isArray(message.tool_calls) ? message.tool_calls.length : 0)
+      + (message.function_call ? 1 : 0);
+    if (toolCalls > 0) visible = true;
+    const hasReasoning = reasoning.trim() !== '';
+    return {
+      protocol: 'chat',
+      finish_reason: choice.finish_reason || null,
+      reasoning_chars: reasoning.length,
+      reasoning_blocks: hasReasoning ? 1 : 0,
+      content_chars: contentChars,
+      tool_calls: toolCalls,
+      has_visible_output: visible,
+      reasoning_only: !visible && hasReasoning,
+      empty: !visible && !hasReasoning
+    };
+  }
+
+  // Anthropic Messages (含网关 SSE 聚合结果)
+  if (body.type === 'message' || (body.role === 'assistant' && Array.isArray(body.content))) {
+    const content = Array.isArray(body.content) ? body.content : [];
+    let reasoningChars = 0;
+    let reasoningBlocks = 0;
+    let contentChars = 0;
+    let toolCalls = 0;
+    let visible = false;
+    for (const block of content) {
+      if (!block || typeof block !== 'object') continue;
+      if (block.type === 'thinking') {
+        reasoningBlocks += 1;
+        if (typeof block.thinking === 'string') reasoningChars += block.thinking.length;
+      } else if (block.type === 'redacted_thinking') {
+        reasoningBlocks += 1;
+      } else if (block.type === 'text') {
+        if (typeof block.text === 'string') {
+          contentChars += block.text.length;
+          if (block.text.trim() !== '') visible = true;
+        }
+      } else if (block.type === 'tool_use') {
+        toolCalls += 1;
+        visible = true;
+      }
+    }
+    const hasReasoning = reasoningChars > 0 || reasoningBlocks > 0;
+    return {
+      protocol: 'anthropic',
+      finish_reason: body.stop_reason || null,
+      reasoning_chars: reasoningChars,
+      reasoning_blocks: reasoningBlocks,
+      content_chars: contentChars,
+      tool_calls: toolCalls,
+      has_visible_output: visible,
+      reasoning_only: !visible && hasReasoning,
+      empty: !visible && !hasReasoning
+    };
+  }
+
+  // Responses (含网关 SSE 聚合结果)
+  if (body.object === 'response' || Array.isArray(body.output)) {
+    const output = Array.isArray(body.output) ? body.output : [];
+    let reasoningChars = 0;
+    let reasoningBlocks = 0;
+    let contentChars = 0;
+    let toolCalls = 0;
+    let visible = false;
+    for (const item of output) {
+      if (!item || typeof item !== 'object') continue;
+      if (item.type === 'reasoning') {
+        reasoningBlocks += 1;
+        const text = extractReasoningSummaryText(item);
+        if (text) reasoningChars += text.length;
+      } else if (['function_call', 'custom_tool_call', 'tool_search_call'].includes(item.type)) {
+        toolCalls += 1;
+        visible = true;
+      } else if (item.type === 'message' && Array.isArray(item.content)) {
+        for (const part of item.content) {
+          if (!part || typeof part !== 'object') continue;
+          if (part.type === 'output_text' && typeof part.text === 'string') {
+            contentChars += part.text.length;
+            if (part.text.trim() !== '') visible = true;
+          } else if (part.type === 'refusal') {
+            const text = typeof part.refusal === 'string' ? part.refusal : '';
+            contentChars += text.length;
+            if (text.trim() !== '') visible = true;
+          }
+        }
+      }
+    }
+    const hasReasoning = reasoningChars > 0 || reasoningBlocks > 0;
+    return {
+      protocol: 'responses',
+      finish_reason: body.status || null,
+      reasoning_chars: reasoningChars,
+      reasoning_blocks: reasoningBlocks,
+      content_chars: contentChars,
+      tool_calls: toolCalls,
+      has_visible_output: visible,
+      reasoning_only: !visible && hasReasoning,
+      empty: !visible && !hasReasoning
+    };
+  }
+
+  return null;
 }
 
 /**
@@ -604,9 +742,10 @@ function openaiToAnthropic(body, opts = {}) {
   const content = [];
   let hasToolUse = false;
 
-  // DeepSeek 等 provider 把思考内容放在 message.reasoning_content
-  if (typeof message.reasoning_content === 'string' && message.reasoning_content !== '') {
-    content.push({ type: 'thinking', thinking: message.reasoning_content });
+  // 思考内容: reasoning_content > reasoning > reasoning_details (同 cc-switch)
+  const reasoningText = messageReasoningText(message);
+  if (reasoningText !== '') {
+    content.push({ type: 'thinking', thinking: reasoningText });
   }
 
   if (typeof message.content === 'string') {
@@ -672,7 +811,7 @@ function openaiToAnthropic(body, opts = {}) {
     content.push({
       type: 'text',
       text: emptyResponseFallbackText(
-        emptyMode, detail, choice.finish_reason, messageReasoningText(message)
+        emptyMode, detail, choice.finish_reason, reasoningText
       )
     });
   }
@@ -864,14 +1003,15 @@ class AnthropicStreamConverter {
 
     const delta = choice.delta || {};
 
-    // reasoning (OpenRouter/Kimi 用 reasoning, DeepSeek 用 reasoning_content)
-    const reasoning = delta.reasoning !== undefined ? delta.reasoning : delta.reasoning_content;
+    // reasoning: reasoning_content > reasoning(字符串/对象) > reasoning_details
+    // (与 cc-switch 一致; 空字符串占位会被忽略)
+    const reasoning = extractReasoningFieldText(delta);
 
     // message_start 延迟到第一个"真实" delta (推理/正文/工具调用) 才发: 只带 role /
     // 空 delta / finish_reason 的 chunk 不触发。这样上游「零内容空 completion」
     // (deepseek-v4-pro 长上下文偶发: 只发 finish_reason=stop 就收尾) 在客户端眼里
     // 一个字节都没发出, 网关可以透明重试上游 (见 server.js EMPTY_RESPONSE_RETRIES)。
-    const hasRealDelta = (typeof reasoning === 'string' && reasoning !== '')
+    const hasRealDelta = reasoning !== null
       || (typeof delta.content === 'string' && delta.content !== '')
       || (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0);
     if (hasRealDelta) this.sawRealDelta = true;
@@ -879,7 +1019,7 @@ class AnthropicStreamConverter {
       out.push(this.messageStartFrame());
       this.hasSentMessageStart = true;
     }
-    if (typeof reasoning === 'string' && reasoning !== '') {
+    if (reasoning !== null) {
       // 攒一份, 万一整条流只有 thinking 就用它当正文兜底 (EMPTY_RESPONSE_MODE 默认 auto)
       this.thinkingText += reasoning;
       if (this.currentNonToolBlockType !== 'thinking') {
@@ -1086,6 +1226,19 @@ class AnthropicStreamConverter {
         }),
         this.frame('content_block_stop', { type: 'content_block_stop', index })
       ]
+    };
+  }
+
+  // 流结束后诊断上游输出 (供网关日志/JSONL 追踪 reasoning-only 退化)。
+  // 与 emptyResponseDetected 不同, 这里也覆盖 finish_reason=length / 上游断流等
+  // 未走空响应兜底的情形; has_visible_output 只统计上游真实产出的正文/工具调用。
+  diagnostics() {
+    return {
+      protocol: 'anthropic',
+      finish_reason: this.upstreamFinishReason,
+      reasoning_chars: this.thinkingText.length,
+      reasoning_blocks: this.thinkingText.trim() !== '' ? 1 : 0,
+      has_visible_output: this.hasEmittedVisibleBlock && !this.emptyResponseDetected
     };
   }
 
@@ -2449,6 +2602,17 @@ class ResponsesStreamConverter {
     };
   }
 
+  // 流结束后诊断上游输出 (同 Anthropic 侧; reasoning 项不算可见输出)
+  diagnostics() {
+    return {
+      protocol: 'responses',
+      finish_reason: this.finishReason,
+      reasoning_chars: this.reasoning.text.length,
+      reasoning_blocks: this.reasoning.text.trim() !== '' ? 1 : 0,
+      has_visible_output: this.hasVisibleOutput() && !this.emptyResponseDetected
+    };
+  }
+
   finalizeReasoning() {
     if (!this.reasoning.added || this.reasoning.done) return [];
     const outputIndex = this.reasoning.outputIndex;
@@ -2675,6 +2839,9 @@ module.exports = {
   // 错误转换
   chatErrorToAnthropicError,
   chatErrorToResponseError,
+  // 响应诊断 / reasoning 提取 (网关注解、测试用)
+  diagnoseResponse,
+  extractReasoningFieldText,
   // 工具函数 (测试用)
   canonicalJsonString,
   canonicalizeToolArguments,

@@ -768,4 +768,91 @@ test('AnthropicStreamConverter: 正常 [DONE] 收尾不受断流兜底影响', (
     'content_block_delta', 'content_block_stop', 'message_delta', 'message_stop']);
 });
 
+// ---------------------------------------------------------------------------
+// 响应诊断 (网关日志/JSONL 追踪 reasoning-only): 有 reasoning、无可见输出
+// ---------------------------------------------------------------------------
+
+test('diagnoseResponse: chat reasoning-only / 有正文 / 全空 / 工具调用', () => {
+  const ro = c.diagnoseResponse({ choices: [{ finish_reason: 'stop',
+    message: { content: '', reasoning_content: '答案在思考里' } }] });
+  assert.strictEqual(ro.protocol, 'chat');
+  assert.strictEqual(ro.reasoning_only, true);
+  assert.strictEqual(ro.has_visible_output, false);
+  assert.strictEqual(ro.reasoning_chars, '答案在思考里'.length);
+  assert.strictEqual(ro.content_chars, 0);
+
+  const ok = c.diagnoseResponse({ choices: [{ finish_reason: 'stop',
+    message: { content: '正文', reasoning_content: '思考' } }] });
+  assert.strictEqual(ok.has_visible_output, true);
+  assert.strictEqual(ok.reasoning_only, false);
+
+  const empty = c.diagnoseResponse({ choices: [{ finish_reason: 'stop',
+    message: { content: '' } }] });
+  assert.strictEqual(empty.empty, true);
+  assert.strictEqual(empty.reasoning_only, false);
+
+  // tool_calls 算可见输出, 即使 content 为空
+  const tools = c.diagnoseResponse({ choices: [{ finish_reason: 'tool_calls',
+    message: { content: null, reasoning_content: 'need tool',
+      tool_calls: [{ id: 'call_1', function: { name: 'bash', arguments: '{}' } }] } }] });
+  assert.strictEqual(tools.has_visible_output, true);
+  assert.strictEqual(tools.tool_calls, 1);
+});
+
+test('diagnoseResponse: Anthropic thinking-only / Responses reasoning-only', () => {
+  const a = c.diagnoseResponse({ type: 'message', role: 'assistant',
+    stop_reason: 'end_turn', content: [{ type: 'thinking', thinking: '答案' }] });
+  assert.strictEqual(a.protocol, 'anthropic');
+  assert.strictEqual(a.reasoning_only, true);
+  assert.strictEqual(a.has_visible_output, false);
+
+  const aOk = c.diagnoseResponse({ type: 'message', role: 'assistant',
+    stop_reason: 'end_turn',
+    content: [{ type: 'thinking', thinking: '思考' }, { type: 'text', text: '正文' }] });
+  assert.strictEqual(aOk.has_visible_output, true);
+
+  const r = c.diagnoseResponse({ object: 'response', status: 'completed', output: [
+    { type: 'reasoning', summary: [{ type: 'summary_text', text: '答案' }] }
+  ] });
+  assert.strictEqual(r.protocol, 'responses');
+  assert.strictEqual(r.reasoning_only, true);
+  assert.strictEqual(r.reasoning_chars, '答案'.length);
+
+  const rOk = c.diagnoseResponse({ object: 'response', status: 'completed', output: [
+    { type: 'reasoning', summary: [{ type: 'summary_text', text: '思考' }] },
+    { type: 'message', content: [{ type: 'output_text', text: '正文' }] }
+  ] });
+  assert.strictEqual(rOk.has_visible_output, true);
+});
+
+test('reasoning_details / reasoning 对象: 提取优先级与 cc-switch 一致', () => {
+  // 非流式: reasoning_details -> thinking 块; content 为空时 auto 回吐
+  const body = { id: 'x', model: 'm', choices: [{ finish_reason: 'stop',
+    message: { content: '', reasoning_details: [{ type: 'reasoning.text', text: '细节思考' }] } }] };
+  const a = c.openaiToAnthropic(body, { emptyResponseMode: 'auto' });
+  assert.deepStrictEqual(a.content[0], { type: 'thinking', thinking: '细节思考' });
+  assert.strictEqual(a.content[1].type, 'text');
+  assert.strictEqual(a.content[1].text, '细节思考'); // 兜底把 reasoning 当正文
+
+  // 流式: delta.reasoning_details -> thinking 块
+  const conv = new c.AnthropicStreamConverter();
+  const out = conv.push(JSON.stringify({ choices: [{ delta: {
+    reasoning_details: [{ type: 'reasoning.text', text: '流式思考' }] } }] })).join('');
+  assert.ok(out.includes('"type":"thinking"'));
+  assert.ok(out.includes('流式思考'));
+});
+
+test('AnthropicStreamConverter: 空 reasoning_content 占位不产生空 thinking 块', () => {
+  // cc-switch v3.20.3 同类修复: 上游每个 chunk 都带 reasoning_content:"" 时
+  // 不能开一个空 thinking 块 (会变成每 token 一行 + 大量空 Thought 块)
+  const a = new c.AnthropicStreamConverter();
+  const out = drive(a, [
+    JSON.stringify({ choices: [{ delta: { reasoning_content: '', content: '正文' } }] }),
+    JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+    '[DONE]',
+  ]);
+  assert.strictEqual(anthropicText(out), '正文');
+  assert.ok(!out.includes('"type":"thinking"'));
+});
+
 console.log(`\nALL ${passed} TESTS PASSED`);
